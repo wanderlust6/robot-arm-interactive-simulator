@@ -1,4 +1,4 @@
-"""Planar serial robot arm kinematics."""
+"""二维平面串联机械臂的运动学计算。"""
 
 from collections.abc import Sequence
 
@@ -6,48 +6,49 @@ import numpy as np
 
 
 class PlanarArm:
-    """A planar serial arm with revolute joints and fixed link lengths.
+    """由转动关节和固定长度连杆组成的平面机械臂。
 
-    Joint angles are relative angles in radians. The first link angle is
-    measured counterclockwise from the positive x-axis.
+    关节角采用弧度制，并且是相对角。第一根连杆相对于 x 轴正方向
+    逆时针转动；后续关节角相对于前一根连杆计算。
     """
 
     def __init__(self, link_lengths: Sequence[float]) -> None:
         try:
             lengths = np.asarray(link_lengths, dtype=float)
         except (TypeError, ValueError) as exc:
-            raise ValueError("link_lengths must be a sequence of finite positive numbers") from exc
+            raise ValueError("连杆长度必须是有限的正数序列") from exc
 
         if lengths.ndim != 1 or lengths.size == 0:
-            raise ValueError("link_lengths must contain at least one link")
+            raise ValueError("至少需要一根连杆")
         if not np.all(np.isfinite(lengths)) or np.any(lengths <= 0):
-            raise ValueError("all link lengths must be finite and greater than zero")
+            raise ValueError("所有连杆长度都必须是有限的正数")
 
         self._link_lengths = lengths.copy()
 
     @property
     def link_lengths(self) -> np.ndarray:
-        """Return a copy of the link lengths."""
+        """返回连杆长度的副本，避免外部修改内部数据。"""
         return self._link_lengths.copy()
 
     @property
     def joint_count(self) -> int:
+        """返回机械臂的关节数量。"""
         return int(self._link_lengths.size)
 
     def _validated_angles(self, joint_angles: Sequence[float]) -> np.ndarray:
         try:
             angles = np.asarray(joint_angles, dtype=float)
         except (TypeError, ValueError) as exc:
-            raise ValueError("joint_angles must be a sequence of finite numbers") from exc
+            raise ValueError("关节角必须是有限数值序列") from exc
 
         if angles.ndim != 1 or angles.size != self.joint_count:
-            raise ValueError("the number of joint angles must match the number of links")
+            raise ValueError("关节角数量必须与连杆数量一致")
         if not np.all(np.isfinite(angles)):
-            raise ValueError("all joint angles must be finite")
+            raise ValueError("所有关节角都必须是有限数值")
         return angles
 
     def forward_kinematics(self, joint_angles: Sequence[float]) -> np.ndarray:
-        """Return base and joint positions as an array with shape (n + 1, 2)."""
+        """计算基座、各关节和末端位置，返回形状为 (n + 1, 2) 的数组。"""
         angles = self._validated_angles(joint_angles)
         absolute_angles = np.cumsum(angles)
 
@@ -61,7 +62,7 @@ class PlanarArm:
         return positions
 
     def jacobian(self, joint_angles: Sequence[float]) -> np.ndarray:
-        """Return the end-effector position Jacobian with shape (2, n)."""
+        """计算末端二维位置的雅可比矩阵，返回形状为 (2, n) 的数组。"""
         positions = self.forward_kinematics(joint_angles)
         end_position = positions[-1]
         joint_to_end = end_position - positions[:-1]
