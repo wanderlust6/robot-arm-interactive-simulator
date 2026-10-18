@@ -1,18 +1,24 @@
 """机械臂交互式仿真平台的首个桌面界面原型。"""
 
+import csv
 import math
 import sys
 from pathlib import Path
 
 import numpy as np
-from PySide6.QtCore import QSignalBlocker, Qt
+from PySide6.QtCore import QSignalBlocker, Qt, QTimer
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QApplication,
+    QDialog,
+    QDialogButtonBox,
     QDockWidget,
     QDoubleSpinBox,
+    QComboBox,
+    QFileDialog,
     QFormLayout,
     QGroupBox,
+    QHBoxLayout,
     QLabel,
     QMainWindow,
     QVBoxLayout,
@@ -20,6 +26,10 @@ from PySide6.QtWidgets import (
     QFrame,
     QPushButton,
     QSpinBox,
+    QStackedWidget,
+    QTableWidget,
+    QTableWidgetItem,
+    QHeaderView,
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -32,6 +42,8 @@ from numerical_ik import solve_n_link_ik, solve_constrained_drag
 from joint_limits import JointLimits, filter_ik_solutions
 from planar_arm import PlanarArm
 from workspace import ArmWorkspace
+from path_trajectory import sample_path_by_arclength, parameterize_path
+from simulation_plot import SimulationPlot, AxisSelectionDialog, VARIABLES, variable_key
 
 
 class MainWindow(QMainWindow):
@@ -52,6 +64,16 @@ class MainWindow(QMainWindow):
         self.target_status = "valid"
         self._updating_controls = False
         self.fixed_nodes = {}
+        self._simulation_timer = QTimer(self)
+        self._simulation_timer.setInterval(30)
+        self._simulation_timer.timeout.connect(self._advance_simulation)
+        self._simulation_times = np.array([], dtype=float)
+        self._simulation_points = np.empty((0, 2), dtype=float)
+        self._simulation_time = 0.0
+        self._simulation_duration = 5.0
+        self._simulation_log_times = []
+        self._simulation_log_positions = []
+        self._simulation_log_angles = []
 
         self._elbow_drag_line_direction = None
         self.workspace = ArmWorkspace(self)
@@ -77,29 +99,670 @@ class MainWindow(QMainWindow):
         toolbar = self.addToolBar("主工具栏")
         toolbar.setMovable(False)
 
-        reset_action = QAction("重置姿态", self)
-        reset_action.triggered.connect(self._reset_pose)
-        toolbar.addAction(reset_action)
+        self.trajectory_edit_action = QAction("轨迹编辑", self)
+        self.trajectory_edit_action.setCheckable(True)
+        self.trajectory_edit_action.setToolTip("切换钢笔式轨迹编辑模式：单击创建直线点，按住拖动创建曲线点")
+        self.trajectory_edit_action.toggled.connect(self._set_trajectory_edit_mode)
+        toolbar.addAction(self.trajectory_edit_action)
 
-        toolbar.addSeparator()
-        toolbar.addWidget(QLabel("连杆数量"))
+        self.simulation_panel_action = QAction("模拟运行", self)
+        self.simulation_panel_action.triggered.connect(lambda: self._show_panel("simulation"))
+        toolbar.addAction(self.simulation_panel_action)
+
+        self.properties_panel_action = QAction("属性与状态", self)
+        self.properties_panel_action.triggered.connect(lambda: self._show_panel("properties"))
+        toolbar.addAction(self.properties_panel_action)
+
+        self.robot_settings_action = QAction("机械臂设置", self)
+        self.robot_settings_action.triggered.connect(lambda: self._show_panel("robot"))
+        toolbar.addAction(self.robot_settings_action)
+
         self.link_count_control = QSpinBox()
         self.link_count_control.setRange(1, 12)
         self.link_count_control.setValue(self.arm.joint_count)
         self.link_count_control.setToolTip("设置平面串联机械臂的连杆数量")
-        toolbar.addWidget(self.link_count_control)
+        self.link_count_control.setVisible(False)
         apply_count = QPushButton("应用")
         apply_count.clicked.connect(self._set_link_count)
-        toolbar.addWidget(apply_count)
-        toolbar.addSeparator()
-        hint = QLabel("固定节点后拖拽其他节点，系统会自动协调未固定关节")
-        toolbar.addWidget(hint)
+        apply_count.setVisible(False)
+        self._apply_link_count_button = apply_count
+
+    def _prepare_simulation(self):
+        self._simulation_timer.stop()
+        anchors = self._simulation_anchor_points()
+        if anchors is None:
+            self._set_status("请先点击“选择路径点”，并按顺序选择至少两个紫色锚点。", "invalid")
+            return
+        try:
+            sampled = sample_path_by_arclength(anchors, sample_count=240)
+            times, points = parameterize_path(sampled, self.simulation_duration_control.value())
+        except ValueError as exc:
+            self._set_status(str(exc), "invalid")
+            return
+        self._simulation_times = times
+        self._simulation_points = points
+        self._simulation_duration = float(times[-1])
+        self._simulation_time = 0.0
+        self._on_target_dragged(float(points[0, 0]), float(points[0, 1]))
+        if self.target_status == "invalid":
+            self._set_status("起点不可达，无法准备仿真；请调整起点或机械臂参数。", "invalid")
+            return
+        self.fixed_nodes[self.arm.joint_count] = self.target.copy()
+        self.workspace.set_state(
+            self.arm.link_lengths, self.joint_angles, self.target, self.target_status, self.fixed_nodes
+        )
+        self._simulation_prepared = True
+        self._clear_simulation_log()
+        self._record_simulation_state(0.0)
+        self.select_path_points_button.setChecked(False)
+        self.simulation_run_button.setEnabled(True)
+        self.simulation_pause_button.setEnabled(False)
+        self.simulation_stop_button.setEnabled(False)
+        self.simulation_pause_button.setText("暂停")
+        self._set_status("仿真已准备：机械臂已到达起点。调整姿态后点击运行。", "valid")
+
+    def _set_path_point_selection_mode(self, enabled):
+        if enabled and self.trajectory_edit_action.isChecked():
+            self.trajectory_edit_action.setChecked(False)
+        if enabled and self._simulation_prepared:
+            self.fixed_nodes.pop(self.arm.joint_count, None)
+            self._refresh_workspace()
+            self._simulation_prepared = False
+        self.workspace.set_path_point_selection_mode(enabled)
+        if enabled:
+            self.simulation_route_indices.clear()
+            self.simulation_path_points_label.setText("尚未选择路径点")
+            self._simulation_prepared = False
+            self.simulation_run_button.setEnabled(False)
+            self._show_panel("simulation")
+            self._set_status("请依次点击轨迹上的紫色锚点；重复点击同一点会再次加入路径序列。", "valid")
+        else:
+            self._set_status("路径点选择结束。", "valid")
+
+    def _on_path_anchor_selected(self, index):
+        if not self.select_path_points_button.isChecked():
+            return
+        anchors = self.workspace.path_anchors()
+        if not 0 <= index < len(anchors):
+            return
+        self.simulation_route_indices.append(index)
+        self.simulation_path_points_label.setText("路径顺序：" + " → ".join(str(i + 1) for i in self.simulation_route_indices))
+        self._simulation_prepared = False
+        self.simulation_run_button.setEnabled(False)
+
+    def _simulation_anchor_points(self):
+        anchors = self.workspace.path_anchors()
+        if len(self.simulation_route_indices) < 2 or not anchors:
+            return None
+        route = []
+        for start, end in zip(self.simulation_route_indices, self.simulation_route_indices[1:]):
+            step = 1 if end >= start else -1
+            segment = list(range(start, end + step, step))
+            if route:
+                segment = segment[1:]
+            route.extend(segment)
+        directed_anchors = []
+        for position, index in enumerate(route):
+            point, incoming, outgoing = anchors[index]
+            previous_index = route[position - 1] if position > 0 else None
+            next_index = route[position + 1] if position + 1 < len(route) else None
+            if previous_index is None:
+                directed_incoming = None
+            elif previous_index < index:
+                directed_incoming = incoming
+            else:
+                directed_incoming = outgoing
+            if next_index is None:
+                directed_outgoing = None
+            elif next_index > index:
+                directed_outgoing = outgoing
+            else:
+                directed_outgoing = incoming
+            directed_anchors.append((point, directed_incoming, directed_outgoing))
+        return directed_anchors
+
+    def _start_simulation(self):
+        if not getattr(self, "_simulation_prepared", False):
+            self._prepare_simulation()
+            if not getattr(self, "_simulation_prepared", False):
+                return
+        self._simulation_timer.stop()
+        if self.trajectory_edit_action.isChecked():
+            self.trajectory_edit_action.setChecked(False)
+        self.fixed_nodes.pop(self.arm.joint_count, None)
+        self._refresh_workspace()
+        self._simulation_time = 0.0
+        self._clear_simulation_log()
+        start = self._simulation_points[0]
+        self._on_target_dragged(float(start[0]), float(start[1]))
+        if self.target_status == "invalid":
+            self._set_status("起点姿态当前不可执行，请重新准备。", "invalid")
+            self._simulation_prepared = False
+            return
+        self._record_simulation_state(0.0)
+        self._simulation_timer.start()
+        self.simulation_pause_button.setEnabled(True)
+        self.simulation_stop_button.setEnabled(True)
+        self.simulation_pause_button.setText("暂停")
+        self._set_status(f"轨迹仿真运行中：时长 {self._simulation_duration:.1f} s。", "valid")
+
+    def _pause_simulation(self):
+        if self._simulation_timer.isActive():
+            self._simulation_timer.stop()
+            self.simulation_pause_button.setText("继续")
+            self._set_status(f"仿真已暂停：t = {self._simulation_time:.2f} s。", "valid")
+        elif len(self._simulation_times) and self._simulation_time < self._simulation_duration:
+            self._simulation_timer.start()
+            self.simulation_pause_button.setText("暂停")
+            self._set_status(f"轨迹仿真继续：t = {self._simulation_time:.2f} s。", "valid")
+
+    def _stop_simulation(self):
+        self._simulation_timer.stop()
+        self._simulation_prepared = False
+        self.fixed_nodes.pop(self.arm.joint_count, None)
+        self._refresh_workspace()
+        self._simulation_time = 0.0
+        self.simulation_pause_button.setEnabled(False)
+        self.simulation_stop_button.setEnabled(False)
+        self.simulation_pause_button.setText("暂停")
+        if len(self._simulation_points):
+            start = self._simulation_points[0]
+            self._on_target_dragged(float(start[0]), float(start[1]))
+        self._refresh_simulation_plot()
+        self._refresh_data_table()
+        self._set_status("轨迹仿真已停止，已保留停止前的数据。", "valid" if self.target_status != "invalid" else "invalid")
+
+    def _clear_simulation_log(self):
+        self._simulation_log_times = []
+        self._simulation_log_positions = []
+        self._simulation_log_angles = []
+        self._refresh_simulation_plot()
+
+    def _record_simulation_state(self, time_value):
+        """记录当前逆运动学求解后的真实末端位置和关节角。"""
+        positions = self.arm.forward_kinematics(self.joint_angles)
+        self._simulation_log_times.append(float(time_value))
+        self._simulation_log_positions.append(positions.copy())
+        self._simulation_log_angles.append(self.joint_angles.copy())
+        self._refresh_simulation_plot()
+        self._refresh_data_table()
+
+    def _refresh_simulation_plot(self):
+        plot = getattr(self, "simulation_plot", None)
+        if plot is None:
+            return
+        plot.set_data(
+            self._simulation_log_times,
+            self._simulation_log_positions,
+            self._simulation_log_angles,
+            self._simulation_time,
+            self._simulation_duration,
+        )
+        if self._plot_window is None:
+            plot.set_configuration(self._plot_configs[0]["x"], self._plot_configs[0]["ys"], "shared")
+            plot.chart_title = self._chart_title(self._plot_configs[0], 1)
+            plot.update()
+        else:
+            while len(self._plot_widgets) < len(self._plot_configs):
+                extra = SimulationPlot(self._plot_window)
+                self._plot_widgets.append(extra)
+                self._plot_window_layout.addWidget(extra, 1)
+            for index, config in enumerate(self._plot_configs):
+                self._plot_widgets[index].set_data(self._simulation_log_times, self._simulation_log_positions, self._simulation_log_angles, self._simulation_time, self._simulation_duration)
+                self._plot_widgets[index].set_configuration(config["x"], config["ys"], "shared")
+                self._plot_widgets[index].chart_title = self._chart_title(config, index + 1)
+                self._plot_widgets[index].update()
+            for index in range(len(self._plot_widgets) - 1, len(self._plot_configs) - 1, -1):
+                self._plot_widgets[index].hide()
+
+    def _chart_title(self, config, chart_index):
+        labels = dict(self._plot_variables())
+        x_label = labels.get(config["x"], config["x"])
+        y_labels = [labels.get(key, key) for key in config["ys"]]
+        return "图 " + str(chart_index) + "  ·  X：" + x_label + "  ·  Y：" + "、".join(y_labels)
+
+    def _plot_summary_text(self):
+        labels = dict(self._plot_variables())
+        lines = []
+        for chart_index, config in enumerate(self._plot_configs, 1):
+            lines.append("图 " + str(chart_index))
+            lines.append("  X 轴：" + labels.get(config["x"], config["x"]))
+            for series_index, key in enumerate(config["ys"], 1):
+                lines.append("  曲线 " + str(series_index) + "，Y 轴：" + labels.get(key, key))
+        return chr(10).join(lines)
+
+    def _open_plot_window(self):
+        if self._plot_window is None:
+            self._plot_window = QDialog(self)
+            self._plot_window.setWindowTitle("仿真数据绘图")
+            self._plot_window.resize(1100, 760)
+            layout = QVBoxLayout(self._plot_window)
+            self._plot_window_layout = layout
+            self._plot_widgets = [self.simulation_plot]
+            layout.addWidget(self.simulation_plot, 1)
+            self._data_button = QPushButton("查看数据")
+            self._data_button.clicked.connect(self._open_data_window)
+            layout.addWidget(self._data_button)
+            export_image = QPushButton("导出图像")
+            export_image.clicked.connect(self._export_plot_image)
+            layout.addWidget(export_image)
+            self._refresh_simulation_plot()
+        self._plot_window.show()
+
+    def _export_plot_image(self):
+        if self._plot_window is None or not self._plot_widgets:
+            self.statusBar().showMessage("请先打开绘图窗口。", 4000)
+            return
+        path, selected_filter = QFileDialog.getSaveFileName(
+            self._plot_window,
+            "导出当前图像",
+            "仿真曲线.png",
+            "PNG 图像 (*.png);;JPEG 图像 (*.jpg *.jpeg);;BMP 图像 (*.bmp)",
+        )
+        if not path:
+            return
+        suffix = Path(path).suffix.lower()
+        if suffix not in (".png", ".jpg", ".jpeg", ".bmp"):
+            suffix = ".jpg" if "JPEG" in selected_filter else ".bmp" if "BMP" in selected_filter else ".png"
+            path += suffix
+        image = self._plot_widgets[0].grab()
+        if image.isNull() or not image.save(path):
+            self.statusBar().showMessage("图像导出失败，请更换保存位置或格式。", 5000)
+            return
+        self.statusBar().showMessage(f"图像已导出：{path}", 6000)
+
+    def _open_data_window(self):
+        if not self._simulation_log_times:
+            self.statusBar().showMessage("当前没有可查看的仿真数据。", 4000)
+            return
+        if getattr(self, "_data_window", None) is None:
+            self._data_window = QDialog(self)
+            self._data_window.setWindowTitle("仿真数据分析")
+            self._data_window.resize(1000, 650)
+            layout = QVBoxLayout(self._data_window)
+            self._data_table = QTableWidget(self._data_window)
+            self._data_table.setAlternatingRowColors(True)
+            self._data_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+            layout.addWidget(self._data_table, 1)
+            controls = QHBoxLayout()
+            add_column = QPushButton("+ 添加数据列")
+            add_column.clicked.connect(self._add_data_column)
+            remove_column = QPushButton("删除选中列")
+            remove_column.clicked.connect(self._remove_data_column)
+            controls.addWidget(add_column)
+            controls.addWidget(remove_column)
+            export_data = QPushButton("导出 CSV")
+            export_data.clicked.connect(self._export_data_csv)
+            controls.addWidget(export_data)
+            controls.addStretch(1)
+            layout.addLayout(controls)
+            self._data_columns = ["time"]
+        self._refresh_data_table()
+        self._data_window.show()
+
+    def _export_data_csv(self):
+        if not self._simulation_log_times:
+            self.statusBar().showMessage("当前没有可导出的仿真数据。", 4000)
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self._data_window,
+            "导出仿真数据",
+            "仿真数据.csv",
+            "CSV 文件 (*.csv)",
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".csv"):
+            path += ".csv"
+        labels = dict(self._plot_variables())
+        columns = list(getattr(self, "_data_columns", ["time"]))
+        try:
+            with open(path, "w", newline="", encoding="utf-8-sig") as file:
+                writer = csv.writer(file)
+                writer.writerow([labels.get(key, key) for key in columns])
+                values_by_column = [self.simulation_plot._values(key) for key in columns]
+                row_count = min((len(values) for values in values_by_column), default=0)
+                for row in range(row_count):
+                    writer.writerow([float(values[row]) for values in values_by_column])
+        except (OSError, ValueError) as exc:
+            self.statusBar().showMessage(f"导出失败：{exc}", 6000)
+            return
+        self.statusBar().showMessage(f"数据已导出：{path}", 6000)
+
+    def _add_data_column(self):
+        dialog = QDialog(self._data_window)
+        dialog.setWindowTitle("添加数据列")
+        form = QFormLayout(dialog)
+        objects = QComboBox()
+        quantities = QComboBox()
+        objects.addItem("时间", "time")
+        for i in range(1, self.arm.joint_count + 1):
+            objects.addItem("节点 " + str(i), "node:" + str(i))
+        for i in range(self.arm.joint_count):
+            objects.addItem("关节/连杆 " + str(i + 1), "joint:" + str(i))
+
+        def fill(_index=None):
+            selected = objects.currentData()
+            quantities.clear()
+            if selected == "time":
+                quantities.addItem("时间", "time")
+            else:
+                prefix, idx_text = selected.split(":")
+                idx = int(idx_text)
+                for key, label in self._plot_variables():
+                    kind, _, variable_index = key.partition(":")
+                    if prefix == "node" and (kind.startswith("node_") or kind == "path") and int(variable_index or 0) == idx:
+                        quantities.addItem(VARIABLES[kind][0], key)
+                    elif prefix == "joint" and (kind.startswith("joint_") or kind == "link_angle") and int(variable_index or 0) == idx:
+                        quantities.addItem(VARIABLES[kind][0], key)
+
+        objects.currentIndexChanged.connect(fill)
+        fill()
+        form.addRow("对象", objects)
+        form.addRow("物理量", quantities)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        form.addRow(buttons)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            key = quantities.currentData()
+            if key and key not in self._data_columns:
+                self._data_columns.append(key)
+                self._refresh_data_table()
+
+    def _remove_data_column(self):
+        column = self._data_table.currentColumn()
+        if column <= 0 or column >= len(self._data_columns):
+            return
+        self._data_columns.pop(column)
+        self._refresh_data_table()
+
+    def _refresh_data_table(self):
+        if not hasattr(self, "_data_table"):
+            return
+        labels = dict(self._plot_variables())
+        self._data_table.setRowCount(len(self._simulation_log_times))
+        self._data_table.setColumnCount(len(self._data_columns))
+        self._data_table.setHorizontalHeaderLabels([labels.get(key, key) for key in self._data_columns])
+        for col, key in enumerate(self._data_columns):
+            values = self.simulation_plot._values(key)
+            for row, value in enumerate(values):
+                if row >= self._data_table.rowCount():
+                    break
+                item = QTableWidgetItem(f"{float(value):.8g}")
+                item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                self._data_table.setItem(row, col, item)
+
+    def _plot_variables(self):
+        variables = [("time", VARIABLES["time"][0])]
+        for index in range(1, self.arm.joint_count + 1):
+            node_name = f"节点 {index}"
+            for kind in ("path", "node_x", "node_y", "node_vx", "node_vy", "node_speed",
+                         "node_ax", "node_ay", "node_accel"):
+                variables.append((variable_key(kind, index), f"{node_name} · {VARIABLES[kind][0]}"))
+        for index in range(self.arm.joint_count):
+            for kind in ("joint_angle", "link_angle", "joint_velocity", "joint_accel"):
+                variables.append((variable_key(kind, index), f"关节/连杆 {index + 1} · {VARIABLES[kind][0]}"))
+        return variables
+
+    def _variable_group(self, key):
+        kind = key.split(":", 1)[0]
+        return VARIABLES.get(kind, ("", "其他", ""))[1]
+
+    def _remove_plot_curve(self, chart_index, series_index):
+        config = self._plot_configs[chart_index]
+        if len(config["ys"]) <= 1:
+            return
+        config["ys"].pop(series_index)
+        self._refresh_plot_configuration_labels()
+        self._refresh_simulation_plot()
+
+    def _add_plot_chart(self):
+        self._plot_configs.append({"x": "time", "ys": ["node_x:3"]})
+        self._refresh_plot_configuration_labels()
+        self._refresh_simulation_plot()
+
+    def _remove_plot_chart(self, chart_index):
+        if len(self._plot_configs) <= 1:
+            return
+        self._plot_configs.pop(chart_index)
+        self._refresh_plot_configuration_labels()
+        self._refresh_simulation_plot()
+
+    def _add_plot_curve(self, chart_index):
+        config = self._plot_configs[chart_index]
+        group = self._variable_group(config["ys"][0])
+        config["ys"].append(config["ys"][0])
+        series_index = len(config["ys"]) - 1
+        self._refresh_plot_configuration_labels()
+        self._set_plot_axis(chart_index, "y", series_index)
+        self._refresh_plot_configuration_labels()
+        self._refresh_simulation_plot()
+
+    def _object_kind(self, key):
+        kind, index = key.split(":", 1) if ":" in key else (key, "0")
+        index = int(index)
+        if kind == "time":
+            return "time", "time", 0
+        if kind == "path":
+            return "node:" + str(index), "path", index
+        if kind.startswith("node_"):
+            return "node:" + str(index), kind, index
+        return "joint:" + str(index), kind, index
+
+    def _set_plot_axis(self, chart_index, axis, series_index=0):
+        config = self._plot_configs[chart_index]
+        current = config["x"] if axis == "x" else config["ys"][series_index]
+        required_unit = (
+            VARIABLES[config["ys"][0].partition(":")[0]][2]
+            if axis == "y" and series_index > 0
+            else None
+        )
+        dialog = QDialog(self)
+        dialog.setWindowTitle("设置 X 轴" if axis == "x" else "设置曲线 " + str(series_index + 1) + " 的 Y 轴")
+        layout = QFormLayout(dialog)
+        object_combo = QComboBox()
+        quantity_combo = QComboBox()
+        options = []
+        if axis == "x":
+            options.append(("time", "时间"))
+        for i in range(1, self.arm.joint_count + 1):
+            node_keys = [variable_key(kind, i) for kind in ("path", "node_x", "node_y", "node_vx", "node_vy", "node_speed", "node_ax", "node_ay", "node_accel")]
+            options.append(("node:" + str(i), "节点 " + str(i)))
+        for i in range(self.arm.joint_count):
+            joint_keys = [variable_key(kind, i) for kind in ("joint_angle", "link_angle", "joint_velocity", "joint_accel")]
+            options.append(("joint:" + str(i), "关节/连杆 " + str(i + 1)))
+        for value, label in options:
+            object_combo.addItem(label, value)
+        current_object, current_kind, current_index = self._object_kind(current)
+        object_combo.setCurrentIndex(max(object_combo.findData(current_object), 0))
+
+        def fill_quantities(_index=None):
+            selected_object = object_combo.currentData()
+            quantity_combo.clear()
+            if selected_object == "time":
+                quantity_combo.setEnabled(False)
+                quantity_combo.addItem("无（时间本身）", "time")
+                return
+            quantity_combo.setEnabled(True)
+            if selected_object == "path":
+                if required_unit is None or VARIABLES["path"][2] == required_unit:
+                    quantity_combo.addItem("累计路径长度", "path")
+                else:
+                    quantity_combo.addItem("无匹配单位", "")
+                return
+            prefix, index_text = selected_object.split(":")
+            index = int(index_text)
+            candidates = []
+            for key, label in self._plot_variables():
+                kind, _, var_index = key.partition(":")
+                same_unit = required_unit is None or VARIABLES[kind][2] == required_unit
+                if prefix == "node" and (kind.startswith("node_") or kind == "path") and int(var_index or 0) == index and same_unit:
+                    candidates.append((key, kind, label))
+                elif prefix == "joint" and (kind.startswith("joint_") or kind == "link_angle") and int(var_index or 0) == index and same_unit:
+                    candidates.append((key, kind, label))
+            for key, quantity, label in candidates:
+                quantity_combo.addItem(VARIABLES[quantity][0], quantity)
+            if quantity_combo.count() == 0:
+                quantity_combo.addItem("无可用物理量", "")
+            idx = quantity_combo.findData(current_kind)
+            if idx >= 0:
+                quantity_combo.setCurrentIndex(idx)
+
+        object_combo.currentIndexChanged.connect(fill_quantities)
+        fill_quantities()
+        quantity_combo.setCurrentIndex(max(quantity_combo.findData(current_kind), 0))
+        layout.addRow("对象", object_combo)
+        layout.addRow("物理量", quantity_combo)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addRow(buttons)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            selected_object = object_combo.currentData()
+            if selected_object == "time":
+                key = "time"
+            elif selected_object == "path":
+                key = "path:0"
+            else:
+                prefix, index_text = selected_object.split(":")
+                index = int(index_text)
+                kind = quantity_combo.currentData()
+                if not kind:
+                    return
+                key = variable_key(kind, index)
+            if axis == "x":
+                config["x"] = key
+            else:
+                config["ys"][series_index] = key
+            self._refresh_plot_configuration_labels()
+            self._refresh_simulation_plot()
+
+    def _short_variable_label(self, key):
+        if key == "time":
+            return "时间"
+        if key.startswith("path"):
+            return "节点" + str(int(key.partition(":")[2] or 0)) + "·累计路径长度"
+        kind, _, index_text = key.partition(":")
+        index = int(index_text or 0)
+        if kind.startswith("node_"):
+            obj = "基座" if index == 0 else "节点" + str(index)
+        else:
+            obj = "关节" + str(index + 1)
+        quantity = VARIABLES.get(kind, (kind, "", ""))[0]
+        quantity = quantity.replace("节点 X 坐标", "X坐标").replace("节点 Y 坐标", "Y坐标")
+        quantity = quantity.replace("节点 X 速度", "X速度").replace("节点 Y 速度", "Y速度")
+        quantity = quantity.replace("节点速度大小", "速度大小").replace("节点 X 加速度", "X加速度").replace("节点 Y 加速度", "Y加速度")
+        quantity = quantity.replace("节点加速度大小", "加速度大小").replace("关节角度", "角度").replace("连杆绝对角度", "方向角")
+        quantity = quantity.replace("关节角速度", "角速度").replace("关节角加速度", "角加速度")
+        return obj + "·" + quantity
+
+    def _refresh_plot_configuration_labels(self):
+        while self._plot_config_layout.count():
+            item = self._plot_config_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.hide()
+                widget.setParent(None)
+                widget.deleteLater()
+        labels = dict(self._plot_variables())
+        for chart_index, config in enumerate(self._plot_configs):
+            group = QGroupBox("图 " + str(chart_index + 1))
+            layout = QVBoxLayout(group)
+            chart_header = QHBoxLayout()
+            chart_header.addWidget(QLabel("图 " + str(chart_index + 1)), 1)
+            remove_chart = QPushButton("×")
+            remove_chart.setFixedWidth(30)
+            remove_chart.setEnabled(len(self._plot_configs) > 1)
+            remove_chart.setToolTip("删除这张图")
+            remove_chart.clicked.connect(lambda checked=False, i=chart_index: self._remove_plot_chart(i))
+            chart_header.addWidget(remove_chart)
+            layout.addLayout(chart_header)
+            x_button = QPushButton("X：" + self._short_variable_label(config["x"]))
+            x_button.clicked.connect(lambda checked=False, i=chart_index: self._set_plot_axis(i, "x"))
+            layout.addWidget(x_button)
+            for series_index, key in enumerate(config["ys"]):
+                row = QHBoxLayout()
+                y_button = QPushButton("曲线 " + str(series_index + 1) + "：" + self._short_variable_label(key))
+                y_button.clicked.connect(lambda checked=False, i=chart_index, j=series_index: self._set_plot_axis(i, "y", j))
+                row.addWidget(y_button, 1)
+                remove_button = QPushButton("×")
+                remove_button.setFixedWidth(30)
+                remove_button.setEnabled(len(config["ys"]) > 1)
+                remove_button.setToolTip("删除这条曲线")
+                remove_button.clicked.connect(lambda checked=False, i=chart_index, j=series_index: self._remove_plot_curve(i, j))
+                row.addWidget(remove_button)
+                layout.addLayout(row)
+            add_curve = QPushButton("＋ 添加曲线")
+            add_curve.clicked.connect(lambda checked=False, i=chart_index: self._add_plot_curve(i))
+            layout.addWidget(add_curve)
+            self._plot_config_layout.addWidget(group)
+        add_chart = QPushButton("＋ 新增图")
+        add_chart.clicked.connect(self._add_plot_chart)
+        self._plot_config_layout.addWidget(add_chart)
+
+    def _advance_simulation(self):
+        if len(self._simulation_times) < 2:
+            self._simulation_timer.stop()
+            return
+        self._simulation_time = min(
+            self._simulation_duration,
+            self._simulation_time + self._simulation_timer.interval() / 1000.0,
+        )
+        x = float(np.interp(self._simulation_time, self._simulation_times, self._simulation_points[:, 0]))
+        y = float(np.interp(self._simulation_time, self._simulation_times, self._simulation_points[:, 1]))
+        self._on_target_dragged(x, y)
+        if self.target_status == "invalid":
+            self._simulation_timer.stop()
+            self.simulation_pause_button.setEnabled(False)
+            self.simulation_stop_button.setEnabled(True)
+            self._set_status("轨迹仿真中断：当前路径点不可达或逆运动学未收敛。", "invalid")
+            return
+        self._record_simulation_state(self._simulation_time)
+        self.statusBar().showMessage(
+            f"轨迹仿真运行中：t = {self._simulation_time:.2f} / {self._simulation_duration:.2f} s。"
+        )
+        if self._simulation_time >= self._simulation_duration:
+            self._simulation_timer.stop()
+            self.simulation_pause_button.setEnabled(False)
+            self.simulation_stop_button.setEnabled(False)
+            self.simulation_pause_button.setText("暂停")
+            self._set_status("轨迹仿真完成。", "valid")
+
+    def _set_trajectory_edit_mode(self, enabled):
+        if enabled and self._simulation_timer.isActive():
+            self._simulation_timer.stop()
+        if enabled:
+            self.select_path_points_button.setChecked(False)
+            self.simulation_route_indices.clear()
+            self.simulation_path_points_label.setText("轨迹已进入编辑模式，请编辑完成后重新选择路径点。")
+            self._simulation_prepared = False
+            self.simulation_run_button.setEnabled(False)
+        self.workspace.set_trajectory_edit_mode(enabled)
+        self.statusBar().showMessage(
+            "轨迹编辑模式：单击添加直线锚点，按住拖动创建曲线锚点。"
+            if enabled
+            else "机械臂操作模式：可拖动末端目标和关节。"
+        )
+
+    def _show_panel(self, page):
+        self._panel_stack.setCurrentWidget(self._panel_pages[page])
+        self._panel_dock.setWindowTitle({
+            "properties": "属性与状态",
+            "simulation": "模拟运行",
+            "robot": "机械臂设置",
+        }[page])
+        if not self._panel_dock.isVisible():
+            self._panel_dock.show()
 
     def _build_properties_panel(self):
         dock = QDockWidget("属性与状态", self)
-        dock.setObjectName("属性与状态面板")
+        dock.setObjectName("共用侧边面板")
         dock.setAllowedAreas(Qt.DockWidgetArea.LeftDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea)
         dock.setMinimumWidth(290)
+        self._panel_dock = dock
+        self._panel_stack = QStackedWidget(dock)
+        self._panel_pages = {}
 
         panel = QWidget(dock)
         layout = QVBoxLayout(panel)
@@ -113,10 +776,22 @@ class MainWindow(QMainWindow):
             control.setValue(float(length))
             control.valueChanged.connect(self._on_link_lengths_changed)
             self.link_controls.append(control)
-            link_form.addRow(f"第 {index + 1} 段长度", control)
+            link_form.addRow(f"第 {index + 1} 段长度（m）", control)
         layout.addWidget(link_group)
 
-        limit_group = QGroupBox("关节角限位（度）")
+        structure_group = QGroupBox("机械臂结构与默认状态")
+        structure_layout = QVBoxLayout(structure_group)
+        structure_layout.addWidget(QLabel("连杆数量"))
+        self.link_count_control.setVisible(True)
+        self._apply_link_count_button.setVisible(True)
+        structure_layout.addWidget(self.link_count_control)
+        structure_layout.addWidget(self._apply_link_count_button)
+        self.reset_pose_button = QPushButton("恢复默认状态")
+        self.reset_pose_button.clicked.connect(self._reset_pose)
+        structure_layout.addWidget(self.reset_pose_button)
+        layout.addWidget(structure_group)
+
+        limit_group = QGroupBox("关节角限位（°；内部使用 rad）")
         limit_form = QFormLayout(limit_group)
         self.limit_form = limit_form
         self.lower_controls = []
@@ -141,8 +816,76 @@ class MainWindow(QMainWindow):
         layout.addWidget(status_group)
         layout.addStretch(1)
 
-        dock.setWidget(panel)
+        self._panel_pages["properties"] = panel
+        self._panel_stack.addWidget(panel)
+
+        simulation_panel = QWidget(dock)
+        simulation_layout = QVBoxLayout(simulation_panel)
+        simulation_layout.addWidget(QLabel("按顺序选择已编辑轨迹上的紫色锚点。可重复选择同一锚点。"))
+        self.simulation_route_indices = []
+        self.simulation_path_points_label = QLabel("尚未选择路径点")
+        self.simulation_path_points_label.setWordWrap(True)
+        simulation_layout.addWidget(self.simulation_path_points_label)
+        self.select_path_points_button = QPushButton("选择路径点")
+        self.select_path_points_button.setCheckable(True)
+        self.select_path_points_button.toggled.connect(self._set_path_point_selection_mode)
+        simulation_layout.addWidget(self.select_path_points_button)
+        self.workspace.path_anchor_selected.connect(self._on_path_anchor_selected)
+
+        duration_form = QFormLayout()
+        self.simulation_duration_control = self._make_spinbox(0.5, 120.0, 1, 0.5)
+        self.simulation_duration_control.setValue(5.0)
+        self.simulation_duration_control.setToolTip("从起点运行到终点所用的仿真时间")
+        duration_form.addRow("仿真时长（s）", self.simulation_duration_control)
+        simulation_layout.addLayout(duration_form)
+        self.simulation_prepare_button = QPushButton("准备")
+        self.simulation_prepare_button.clicked.connect(self._prepare_simulation)
+        simulation_layout.addWidget(self.simulation_prepare_button)
+        self.simulation_run_button = QPushButton("运行")
+        self.simulation_run_button.clicked.connect(self._start_simulation)
+        self.simulation_run_button.setEnabled(False)
+        simulation_layout.addWidget(self.simulation_run_button)
+        self.simulation_pause_button = QPushButton("暂停")
+        self.simulation_pause_button.clicked.connect(self._pause_simulation)
+        self.simulation_pause_button.setEnabled(False)
+        simulation_layout.addWidget(self.simulation_pause_button)
+        self.simulation_stop_button = QPushButton("停止")
+        self.simulation_stop_button.clicked.connect(self._stop_simulation)
+        self.simulation_stop_button.setEnabled(False)
+        simulation_layout.addWidget(self.simulation_stop_button)
+        self.simulation_status_label = QLabel("先设置路径点，再点击准备。")
+        self.simulation_status_label.setWordWrap(True)
+        simulation_layout.addWidget(self.simulation_status_label)
+        self._plot_variables_cache = None
+        self._plot_configs = [{"x": "time", "ys": ["node_x:3"]}]
+        self._plot_display_mode = "shared"
+        self._plot_config_layout = QVBoxLayout()
+        simulation_layout.addLayout(self._plot_config_layout)
+        self.simulation_plot = SimulationPlot()
+        self._plot_window = None
+        self.plot_summary_label = QLabel()
+        self.plot_summary_label.setWordWrap(True)
+        self.plot_summary_label.setVisible(False)
+        simulation_layout.addWidget(self.plot_summary_label)
+        self.open_plot_window_button = QPushButton("打开绘图窗口")
+        self.open_plot_window_button.clicked.connect(self._open_plot_window)
+        simulation_layout.addWidget(self.open_plot_window_button)
+        self._refresh_plot_configuration_labels()
+        simulation_layout.addStretch(1)
+        self._panel_pages["simulation"] = simulation_panel
+        self._panel_stack.addWidget(simulation_panel)
+
+        robot_panel = QWidget(dock)
+        robot_layout = QVBoxLayout(robot_panel)
+        robot_layout.addWidget(QLabel("固定节点后拖拽其他节点，可通过约束求解协调关节。"))
+        robot_layout.addStretch(1)
+        self._panel_pages["robot"] = robot_panel
+        self._panel_stack.addWidget(robot_panel)
+
+        dock.setWidget(self._panel_stack)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
+        dock.hide()
+        self._simulation_prepared = False
 
 
     @staticmethod
@@ -193,7 +936,7 @@ class MainWindow(QMainWindow):
             control.setValue(length)
             control.valueChanged.connect(self._on_link_lengths_changed)
             self.link_controls.append(control)
-            self.link_form.addRow(f"第 {index + 1} 段长度", control)
+            self.link_form.addRow(f"第 {index + 1} 段长度（m）", control)
 
         for index in range(count):
             lower_control = self._make_spinbox(-360.0, 360.0, 1, 1.0)
@@ -512,8 +1255,8 @@ class MainWindow(QMainWindow):
         index = self.joint_popup_index
         angle = 0.0 if index == 0 else math.degrees(float(np.sum(self.joint_angles[:index])))
         self.joint_popup_title.setText("基座节点（始终固定）" if index == 0 else f"节点 {index}")
-        self.joint_popup_angle.setText(f"角度：{angle:.2f}°")
-        self.joint_popup_position.setText(f"坐标：({positions[index][0]:.3f}, {positions[index][1]:.3f})")
+        self.joint_popup_angle.setText(f"累计角度：{angle:.2f}°（{math.radians(angle):.4f} rad）")
+        self.joint_popup_position.setText(f"坐标（m）：({positions[index][0]:.3f}, {positions[index][1]:.3f})")
         self.joint_popup_pin.blockSignals(True)
         self.joint_popup_pin.setEnabled(index != 0)
         self.joint_popup_pin.setChecked(index in self.fixed_nodes)
@@ -546,6 +1289,8 @@ class MainWindow(QMainWindow):
 
     def _set_status(self, message, status):
         self.status_label.setText(message)
+        if hasattr(self, "simulation_status_label"):
+            self.simulation_status_label.setText(message)
         self.statusBar().showMessage(message)
         colors = {
             "valid": "#237a57",

@@ -9,6 +9,7 @@ from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
 from app import MainWindow, _unwrap_angle_near
+from path_trajectory import sample_path_by_arclength, parameterize_path
 from elbow_drag import solve_elbow_drag_candidates
 from joint_limits import JointLimits
 
@@ -146,6 +147,157 @@ class TestDesktopPrototype(unittest.TestCase):
         self.application.processEvents()
 
         self.assertEqual(workspace._selected_object, ("link", 0))
+
+    def test_trajectory_pen_click_drag_and_delete_anchor(self):
+        self.window.show()
+        self.application.processEvents()
+        workspace = self.window.workspace
+        workspace.set_trajectory_edit_mode(True)
+
+        first = QPoint(120, 120)
+        second = QPoint(230, 170)
+        QTest.mouseClick(workspace, Qt.MouseButton.LeftButton, pos=first)
+        QTest.mousePress(workspace, Qt.MouseButton.LeftButton, pos=second)
+        QTest.mouseMove(workspace, QPoint(270, 145), delay=20)
+        QTest.mouseRelease(workspace, Qt.MouseButton.LeftButton, pos=QPoint(270, 145))
+        self.application.processEvents()
+
+        anchors = workspace.path_anchors()
+        self.assertEqual(len(anchors), 2)
+        self.assertIsNone(anchors[0][1])
+        self.assertIsNotNone(anchors[1][1])
+
+        QTest.mouseClick(workspace, Qt.MouseButton.LeftButton, pos=first)
+        QTest.keyClick(workspace, Qt.Key.Key_Delete)
+        self.application.processEvents()
+        self.assertEqual(len(workspace.path_anchors()), 1)
+
+    def test_dragging_blank_workspace_pans_view_without_moving_arm(self):
+        self.window.show()
+        self.application.processEvents()
+        workspace = self.window.workspace
+        origin_before, _ = workspace._view_parameters()
+        angles_before = self.window.joint_angles.copy()
+        start = QPoint(40, 80)
+        end = QPoint(95, 125)
+
+        QTest.mousePress(workspace, Qt.MouseButton.LeftButton, pos=start)
+        QTest.mouseMove(workspace, end, delay=20)
+        QTest.mouseRelease(workspace, Qt.MouseButton.LeftButton, pos=end)
+        self.application.processEvents()
+
+        origin_after, _ = workspace._view_parameters()
+        self.assertAlmostEqual(origin_after.x() - origin_before.x(), 55.0, delta=2.0)
+        self.assertAlmostEqual(origin_after.y() - origin_before.y(), 45.0, delta=2.0)
+        np.testing.assert_allclose(self.window.joint_angles, angles_before, atol=1e-12)
+        self.assertFalse(workspace._panning)
+
+    def test_path_sampling_preserves_endpoints_and_uniform_time(self):
+        anchors = [
+            (np.array([0.0, 0.0]), None, None),
+            (np.array([2.0, 0.0]), None, None),
+        ]
+        points = sample_path_by_arclength(anchors, sample_count=21)
+        self.assertEqual(points.shape, (21, 2))
+        np.testing.assert_allclose(points[0], [0.0, 0.0], atol=1e-12)
+        np.testing.assert_allclose(points[-1], [2.0, 0.0], atol=1e-12)
+        np.testing.assert_allclose(points[:, 1], 0.0, atol=1e-12)
+        times, trajectory = parameterize_path(points, 4.0)
+        self.assertEqual(len(times), len(trajectory))
+        self.assertAlmostEqual(times[0], 0.0)
+        self.assertAlmostEqual(times[-1], 4.0)
+        self.assertTrue(np.all(np.diff(times) > 0.0))
+        np.testing.assert_allclose(trajectory, points, atol=1e-12)
+
+    def test_simulation_panel_prepares_start_and_fixes_endpoint(self):
+        self.window._show_panel("simulation")
+        self.window.workspace._path_anchors = [
+            (np.array([1.0, 1.0]), None, None),
+            (np.array([1.2, 1.0]), None, None),
+        ]
+        self.window.simulation_route_indices = [0, 1]
+        self.window._prepare_simulation()
+        self.assertTrue(self.window._simulation_prepared)
+        self.assertIn(self.window.arm.joint_count, self.window.fixed_nodes)
+        np.testing.assert_allclose(
+            self.window.arm.forward_kinematics(self.window.joint_angles)[-1],
+            self.window.fixed_nodes[self.window.arm.joint_count],
+            atol=1e-6,
+        )
+
+    def test_toolbar_switches_shared_panel_pages(self):
+        self.window._show_panel("simulation")
+        self.assertIs(self.window._panel_stack.currentWidget(), self.window._panel_pages["simulation"])
+        self.window._show_panel("properties")
+        self.assertIs(self.window._panel_stack.currentWidget(), self.window._panel_pages["properties"])
+        self.window._show_panel("robot")
+        self.assertIs(self.window._panel_stack.currentWidget(), self.window._panel_pages["robot"])
+
+    def test_workspace_selection_only_accepts_existing_path_anchors(self):
+        workspace = self.window.workspace
+        workspace._path_anchors = [
+            (np.array([0.0, 0.5]), None, None),
+            (np.array([1.0, 0.5]), None, None),
+        ]
+        workspace.set_path_point_selection_mode(True)
+        selected = []
+        workspace.path_anchor_selected.connect(selected.append)
+        self.window.show()
+        self.application.processEvents()
+        origin, scale = workspace._view_parameters()
+        anchor = workspace._world_to_screen(workspace._path_anchors[1][0], origin, scale)
+        QTest.mouseClick(workspace, Qt.MouseButton.LeftButton, pos=QPoint(round(anchor.x()), round(anchor.y())))
+        self.application.processEvents()
+        self.assertEqual(selected, [1])
+        non_anchor = workspace._world_to_screen([0.5, 0.9], origin, scale)
+        QTest.mouseClick(workspace, Qt.MouseButton.LeftButton, pos=QPoint(round(non_anchor.x()), round(non_anchor.y())))
+        self.application.processEvents()
+        self.assertEqual(selected, [1])
+
+    def test_route_selection_preserves_repeats_and_expands_reverse_segments(self):
+        workspace = self.window.workspace
+        workspace._path_anchors = [
+            (np.array([1.0, 1.0]), np.array([-0.1, 0.0]), np.array([0.1, 0.0])),
+            (np.array([1.2, 1.1]), np.array([-0.1, 0.0]), np.array([0.1, 0.0])),
+            (np.array([1.4, 1.0]), np.array([-0.1, 0.0]), np.array([0.1, 0.0])),
+            (np.array([1.6, 1.1]), np.array([-0.1, 0.0]), np.array([0.1, 0.0])),
+        ]
+        self.window.select_path_points_button.setChecked(True)
+        for index in (0, 2, 0):
+            self.window._on_path_anchor_selected(index)
+        self.assertEqual(self.window.simulation_route_indices, [0, 2, 0])
+        self.assertIn("1 → 3 → 1", self.window.simulation_path_points_label.text())
+        anchors = self.window._simulation_anchor_points()
+        self.assertEqual(len(anchors), 5)
+        np.testing.assert_allclose(
+            np.array([item[0] for item in anchors]),
+            [[1.0, 1.0], [1.2, 1.1], [1.4, 1.0], [1.2, 1.1], [1.0, 1.0]],
+        )
+        np.testing.assert_allclose(anchors[3][1], [0.1, 0.0])
+        np.testing.assert_allclose(anchors[3][2], [-0.1, 0.0])
+
+    def test_simulation_requires_two_selected_path_points(self):
+        self.window._prepare_simulation()
+        self.assertFalse(self.window._simulation_timer.isActive())
+        self.assertIn("选择路径点", self.window.status_label.text())
+
+    def test_simulation_runs_through_reachable_path_and_finishes(self):
+        workspace = self.window.workspace
+        workspace._path_anchors = [
+            (np.array([1.0, 1.0]), None, None),
+            (np.array([1.2, 1.0]), None, None),
+        ]
+        self.window.simulation_route_indices = [0, 1]
+        self.window.simulation_duration_control.setValue(0.5)
+        self.window._start_simulation()
+        self.assertTrue(self.window._simulation_timer.isActive())
+        for _ in range(20):
+            if not self.window._simulation_timer.isActive():
+                break
+            self.window._advance_simulation()
+        self.assertFalse(self.window._simulation_timer.isActive())
+        self.assertAlmostEqual(self.window._simulation_time, 0.5, places=7)
+        self.assertIn("完成", self.window.status_label.text())
 
     def test_workspace_renders_in_offscreen_mode(self):
         self.window.show()
@@ -543,6 +695,53 @@ class TestDesktopPrototype(unittest.TestCase):
 
         np.testing.assert_allclose(self.window.joint_angles, original_angles, atol=1e-12)
         self.assertIn("数量与机械臂关节数量不一致", self.window.status_label.text())
+
+
+    def test_simulation_plot_records_actual_state_on_shared_time_axis(self):
+        self.window._simulation_duration = 2.0
+        self.window._simulation_time = 0.5
+        self.window._record_simulation_state(0.5)
+
+        actual_endpoint = self.window.arm.forward_kinematics(self.window.joint_angles)[-1]
+        self.assertEqual(self.window._simulation_log_times, [0.5])
+        np.testing.assert_allclose(self.window._simulation_log_positions[0][-1], actual_endpoint)
+        np.testing.assert_allclose(self.window._simulation_log_angles[0], self.window.joint_angles)
+        self.assertEqual(self.window.simulation_plot._current_time, 0.5)
+        self.assertEqual(self.window.simulation_plot._duration, 2.0)
+
+    def test_simulation_plot_data_is_reset_for_a_new_run(self):
+        self.window._record_simulation_state(0.0)
+        self.window._record_simulation_state(0.03)
+        self.window._clear_simulation_log()
+
+        self.assertEqual(self.window._simulation_log_times, [])
+        self.assertEqual(self.window.simulation_plot._times.size, 0)
+        self.assertEqual(self.window.simulation_plot._positions.shape[0], 0)
+
+    def test_plot_logs_all_nodes_and_builds_variable_options(self):
+        self.window._record_simulation_state(0.0)
+        positions = self.window.simulation_plot._positions
+        self.assertEqual(positions.shape, (1, self.window.arm.joint_count + 1, 2))
+        options = dict(self.window._plot_variables())
+        self.assertIn("node_x:1", options)
+        self.assertIn("node_speed:3", options)
+        self.assertIn("joint_velocity:1", options)
+
+    def test_plot_computes_endpoint_path_length_and_node_speed(self):
+        from simulation_plot import SimulationPlot
+
+        plot = SimulationPlot()
+        times = np.array([0.0, 1.0, 2.0])
+        positions = np.array([
+            [[0.0, 0.0], [0.0, 0.0]],
+            [[0.0, 0.0], [1.0, 0.0]],
+            [[0.0, 0.0], [2.0, 0.0]],
+        ])
+        angles = np.zeros((3, 1))
+        plot.set_data(times, positions, angles, 1.0, 2.0)
+        np.testing.assert_allclose(plot._values("path:1"), [0.0, 1.0, 2.0])
+        np.testing.assert_allclose(plot._values("node_speed:1"), [1.0, 1.0, 1.0])
+        np.testing.assert_allclose(plot._values("node_ax:1"), [0.0, 0.0, 0.0], atol=1e-10)
 
 
 if __name__ == "__main__":

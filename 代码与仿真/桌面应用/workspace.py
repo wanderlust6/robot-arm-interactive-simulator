@@ -20,6 +20,7 @@ class ArmWorkspace(QWidget):
     intermediate_joint_drag_started = Signal(int, float, float)
     intermediate_joint_dragged = Signal(int, float, float)
     intermediate_joint_drag_finished = Signal()
+    path_anchor_selected = Signal(int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -32,6 +33,8 @@ class ArmWorkspace(QWidget):
         self._fixed_nodes = {}
         self._zoom = 1.0
         self._view_offset = QPointF(0.0, 0.0)
+        self._panning = False
+        self._pan_last_position = None
         self._drag_mode = "forward"
         self._dragging_target = False
         self._dragging_elbow = False
@@ -39,6 +42,15 @@ class ArmWorkspace(QWidget):
         self._dragged_joint_index = None
         self._drag_line_direction = None
         self._selected_object = ("joint", 0)
+        self._trajectory_edit_mode = False
+        self._path_point_selection_mode = False
+        self._path_anchors = []
+        self._path_press_position = None
+        self._path_dragged = False
+        self._path_preview_anchor = None
+        self._selected_path_anchor = None
+        self._path_edit_target = None
+        self._path_edit_last_world = None
         self._pending_drag_update = None
         self._drag_update_timer = QTimer(self)
         self._drag_update_timer.setSingleShot(True)
@@ -67,6 +79,62 @@ class ArmWorkspace(QWidget):
     def set_drag_mode(self, mode):
         self._drag_mode = mode
         self.update()
+
+    def set_path_point_selection_mode(self, enabled):
+        self._path_point_selection_mode = bool(enabled)
+        self.update()
+
+    def set_trajectory_edit_mode(self, enabled):
+        self._trajectory_edit_mode = bool(enabled)
+        self._path_press_position = None
+        self._path_preview_anchor = None
+        self._path_dragged = False
+        self._path_edit_target = None
+        self._path_edit_last_world = None
+        if not self._trajectory_edit_mode:
+            self._selected_path_anchor = None
+        self.update()
+
+    def path_anchors(self):
+        return [
+            (
+                point.copy(),
+                None if incoming is None else incoming.copy(),
+                None if outgoing is None else outgoing.copy(),
+            )
+            for point, incoming, outgoing in self._path_anchors
+        ]
+
+    def clear_path(self):
+        self._path_anchors.clear()
+        self._path_preview_anchor = None
+        self._selected_path_anchor = None
+        self.update()
+
+    def _delete_selected_path_anchor(self):
+        if self._selected_path_anchor is None:
+            if self._path_anchors:
+                self._path_anchors.pop()
+                self.update()
+            return
+        if 0 <= self._selected_path_anchor < len(self._path_anchors):
+            self._path_anchors.pop(self._selected_path_anchor)
+        self._selected_path_anchor = None
+        self.update()
+
+    def keyPressEvent(self, event):
+        if self._trajectory_edit_mode and event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+            self._delete_selected_path_anchor()
+            event.accept()
+            return
+        if self._trajectory_edit_mode and event.key() == Qt.Key.Key_Escape:
+            self._path_press_position = None
+            self._path_preview_anchor = None
+            self._path_dragged = False
+            self.update()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def set_state(self, link_lengths, joint_angles, target, target_status="valid", fixed_nodes=None):
         """更新工作区显示状态。"""
@@ -202,15 +270,78 @@ class ArmWorkspace(QWidget):
             QPointF(target_point.x(), target_point.y() + 7),
         )
 
+        self._draw_trajectory_path(painter, origin, scale)
+
         painter.setPen(QColor("#27364b"))
-        painter.drawText(18, 28, "二维机械臂工作区")
+        painter.drawText(18, 28, "二维机械臂工作区（坐标单位：m）")
         painter.setPen(QColor("#63738a"))
         instruction = (
-            "拖动橙色末端移动目标；拖动第二关节可沿固定直线移动末端"
-            if len(self._link_lengths) == 2
-            else "拖动橙色末端移动目标；拖动中间节点可带动下游整体绕前一节点旋转"
+            "轨迹编辑：单击添加直线锚点，按住拖动创建曲线锚点"
+            if self._trajectory_edit_mode
+            else (
+                "拖动橙色末端移动目标；拖动第二关节可沿固定直线移动末端"
+                if len(self._link_lengths) == 2
+                else "拖动橙色末端移动目标；拖动中间节点可带动下游整体绕前一节点旋转"
+            )
         )
         painter.drawText(18, 50, instruction)
+
+    def _draw_trajectory_path(self, painter, origin, scale):
+        anchors = list(self._path_anchors)
+        if self._path_preview_anchor is not None:
+            anchors.append(self._path_preview_anchor)
+        if not anchors:
+            return
+
+        screen = []
+        for point, incoming, outgoing in anchors:
+            screen.append((
+                self._world_to_screen(point, origin, scale),
+                None if incoming is None else incoming,
+                None if outgoing is None else outgoing,
+            ))
+
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(QPen(QColor("#111111"), 2.0))
+        for index in range(len(screen) - 1):
+            p0, _in0, out0 = screen[index]
+            p3, in3, _out3 = screen[index + 1]
+            if out0 is None and in3 is None:
+                painter.drawLine(p0, p3)
+                continue
+            dx, dy = p3.x() - p0.x(), p3.y() - p0.y()
+            c1 = QPointF(p0.x() + (out0[0] * scale if out0 is not None else dx / 3),
+                         p0.y() - (out0[1] * scale if out0 is not None else -dy / 3))
+            c2 = QPointF(p3.x() + (in3[0] * scale if in3 is not None else -dx / 3),
+                         p3.y() - (in3[1] * scale if in3 is not None else dy / 3))
+            previous = p0
+            for step in range(1, 31):
+                t = step / 30
+                u = 1 - t
+                point = QPointF(
+                    u**3 * p0.x() + 3*u*u*t*c1.x() + 3*u*t*t*c2.x() + t**3*p3.x(),
+                    u**3 * p0.y() + 3*u*u*t*c1.y() + 3*u*t*t*c2.y() + t**3*p3.y(),
+                )
+                painter.drawLine(previous, point)
+                previous = point
+
+        for index, (point, incoming, outgoing) in enumerate(screen):
+            if self._trajectory_edit_mode and index == self._selected_path_anchor:
+                for handle in (incoming, outgoing):
+                    if handle is None:
+                        continue
+                    handle_point = QPointF(
+                        point.x() + handle[0] * scale,
+                        point.y() - handle[1] * scale,
+                    )
+                    painter.setPen(QPen(QColor("#c7cbd1"), 1.5, Qt.PenStyle.DashLine))
+                    painter.drawLine(point, handle_point)
+                    painter.setPen(QPen(QColor("#a6abb3"), 1.5))
+                    painter.setBrush(QColor("#ffffff"))
+                    painter.drawEllipse(handle_point, 4, 4)
+            painter.setPen(QPen(QColor("#2563eb") if index == self._selected_path_anchor else QColor("#7c3aed"), 2))
+            painter.setBrush(QColor("#ffffff"))
+            painter.drawEllipse(point, 5, 5)
 
     def _draw_drag_line(self, painter, origin, scale):
         """拖动肘关节时显示末端被限制运动的固定直线。"""
@@ -259,6 +390,54 @@ class ArmWorkspace(QWidget):
     def mousePressEvent(self, event):
         if event.button() != Qt.MouseButton.LeftButton:
             return super().mousePressEvent(event)
+        if self._path_point_selection_mode and not self._trajectory_edit_mode:
+            cursor = event.position()
+            origin, scale = self._view_parameters()
+            for index, (point, _incoming, _outgoing) in enumerate(self._path_anchors):
+                anchor_screen = self._world_to_screen(point, origin, scale)
+                if math.hypot(cursor.x() - anchor_screen.x(), cursor.y() - anchor_screen.y()) <= 12:
+                    self.path_anchor_selected.emit(index)
+                    event.accept()
+                    return
+            event.accept()
+            return
+        if self._trajectory_edit_mode:
+            self.setFocus(Qt.FocusReason.MouseFocusReason)
+            cursor = event.position()
+            origin, scale = self._view_parameters()
+            world_cursor = self._screen_to_world(cursor, origin, scale)
+
+            for index, (point, incoming, outgoing) in enumerate(self._path_anchors):
+                anchor_screen = self._world_to_screen(point, origin, scale)
+                for name, handle in (("in", incoming), ("out", outgoing)):
+                    if handle is None:
+                        continue
+                    handle_screen = QPointF(
+                        anchor_screen.x() + handle[0] * scale,
+                        anchor_screen.y() - handle[1] * scale,
+                    )
+                    if math.hypot(cursor.x() - handle_screen.x(), cursor.y() - handle_screen.y()) <= 9:
+                        self._selected_path_anchor = index
+                        self._path_edit_target = ("handle", index, name)
+                        self._path_edit_last_world = world_cursor
+                        self.update()
+                        event.accept()
+                        return
+                if math.hypot(cursor.x() - anchor_screen.x(), cursor.y() - anchor_screen.y()) <= 10:
+                    self._selected_path_anchor = index
+                    self._path_edit_target = ("anchor", index)
+                    self._path_edit_last_world = world_cursor
+                    self.update()
+                    event.accept()
+                    return
+
+            self._selected_path_anchor = None
+            self._path_edit_target = None
+            self._path_press_position = event.position()
+            self._path_dragged = False
+            self._path_preview_anchor = None
+            event.accept()
+            return
 
         origin, scale = self._view_parameters()
         positions = self._joint_positions()
@@ -360,9 +539,58 @@ class ArmWorkspace(QWidget):
             self.target_dragged.emit(float(self._target[0]), float(self._target[1]))
             event.accept()
             return
-        super().mousePressEvent(event)
+
+        self._panning = True
+        self._pan_last_position = cursor
+        event.accept()
 
     def mouseMoveEvent(self, event):
+        if self._panning and self._pan_last_position is not None:
+            cursor = event.position()
+            delta = cursor - self._pan_last_position
+            self._view_offset = QPointF(
+                self._view_offset.x() + delta.x(),
+                self._view_offset.y() + delta.y(),
+            )
+            self._pan_last_position = cursor
+            self.update()
+            event.accept()
+            return
+        if self._trajectory_edit_mode and self._path_edit_target is not None:
+            cursor = self._screen_to_world(event.position(), *self._view_parameters())
+            mode, index, *extra = self._path_edit_target
+            point, incoming, outgoing = self._path_anchors[index]
+            if mode == "anchor":
+                delta = cursor - self._path_edit_last_world
+                point = point + delta
+                self._path_anchors[index] = (point, incoming, outgoing)
+            else:
+                vector = cursor - point
+                if extra[0] == "in":
+                    incoming = vector
+                else:
+                    outgoing = vector
+                self._path_anchors[index] = (point, incoming, outgoing)
+            self._path_edit_last_world = cursor
+            self.update()
+            event.accept()
+            return
+        if self._trajectory_edit_mode and self._path_press_position is not None:
+            cursor = event.position()
+            distance = math.hypot(cursor.x() - self._path_press_position.x(), cursor.y() - self._path_press_position.y())
+            if distance > 5:
+                self._path_dragged = True
+            origin, scale = self._view_parameters()
+            point = self._screen_to_world(self._path_press_position, origin, scale)
+            incoming = outgoing = None
+            if self._path_dragged:
+                current = self._screen_to_world(cursor, origin, scale)
+                outgoing = current - point
+                incoming = -outgoing
+            self._path_preview_anchor = (point, incoming, outgoing)
+            self.update()
+            event.accept()
+            return
         if self._dragging_elbow:
             origin, scale = self._view_parameters()
             position = self._screen_to_world(event.position(), origin, scale)
@@ -386,6 +614,33 @@ class ArmWorkspace(QWidget):
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self._panning:
+            self._panning = False
+            self._pan_last_position = None
+            event.accept()
+            return
+        if event.button() == Qt.MouseButton.LeftButton and self._trajectory_edit_mode and self._path_edit_target is not None:
+            self._path_edit_target = None
+            self._path_edit_last_world = None
+            self.update()
+            event.accept()
+            return
+        if event.button() == Qt.MouseButton.LeftButton and self._trajectory_edit_mode and self._path_press_position is not None:
+            origin, scale = self._view_parameters()
+            point = self._screen_to_world(self._path_press_position, origin, scale)
+            incoming = outgoing = None
+            if self._path_dragged:
+                current = self._screen_to_world(event.position(), origin, scale)
+                outgoing = current - point
+                incoming = -outgoing
+            self._path_anchors.append((point, incoming, outgoing))
+            self._selected_path_anchor = len(self._path_anchors) - 1
+            self._path_press_position = None
+            self._path_preview_anchor = None
+            self._path_dragged = False
+            self.update()
+            event.accept()
+            return
         if event.button() == Qt.MouseButton.LeftButton:
             if self._drag_update_timer.isActive():
                 self._drag_update_timer.stop()
