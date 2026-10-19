@@ -24,6 +24,7 @@ VARIABLES = {
     "link_angle": ("连杆绝对方向 φ (°)", "角度", "°"),
     "joint_velocity": ("关节角速度 (rad/s)", "角速度", "rad/s"),
     "joint_accel": ("关节角加速度 (rad/s²)", "角加速度", "rad/s²"),
+    "joint_torque": ("关节驱动力矩 τ (N·m)", "力矩", "N·m"),
 }
 
 
@@ -114,6 +115,7 @@ class SimulationPlot(QWidget):
         self._times = np.array([], dtype=float)
         self._positions = np.empty((0, 1, 2), dtype=float)
         self._angles = np.empty((0, 0), dtype=float)
+        self._torques = np.empty((0, 0), dtype=float)
         self._current_time = 0.0
         self._duration = 1.0
         self.x_variable = "time"
@@ -121,7 +123,7 @@ class SimulationPlot(QWidget):
         self.display_mode = "separate"
         self.chart_title = ""
 
-    def set_data(self, times, positions, angles, current_time, duration):
+    def set_data(self, times, positions, angles, current_time, duration, torques=None):
         self._times = np.asarray(times, dtype=float).copy()
         pos = np.asarray(positions, dtype=float)
         if pos.size == 0:
@@ -132,6 +134,8 @@ class SimulationPlot(QWidget):
             self._positions = pos.copy()
         angle_values = np.asarray(angles, dtype=float)
         self._angles = angle_values.copy() if angle_values.size else np.empty((0, 0), dtype=float)
+        torque_values = np.asarray(torques, dtype=float) if torques is not None else np.empty((0, 0), dtype=float)
+        self._torques = torque_values.copy() if torque_values.size else np.empty((0, 0), dtype=float)
         self._current_time = max(0.0, float(current_time))
         self._duration = max(float(duration), 1e-9)
         self.update()
@@ -168,6 +172,8 @@ class SimulationPlot(QWidget):
             if kind == "node_ax": return acceleration[:, 0]
             if kind == "node_ay": return acceleration[:, 1]
             if kind == "node_accel": return np.linalg.norm(acceleration, axis=1)
+        if kind == "joint_torque":
+            return self._torques[:, index] if index < self._torques.shape[1] else np.zeros(count)
         if kind.startswith("joint_") or kind == "link_angle":
             if kind == "joint_angle":
                 return np.degrees(self._angles[:, index]) if index < self._angles.shape[1] else np.zeros(count)

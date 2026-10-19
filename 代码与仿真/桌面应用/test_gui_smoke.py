@@ -218,6 +218,8 @@ class TestDesktopPrototype(unittest.TestCase):
         self.window.simulation_route_indices = [0, 1]
         self.window._prepare_simulation()
         self.assertTrue(self.window._simulation_prepared)
+        self.assertIsNotNone(self.window._planned_joint_angles)
+        self.assertEqual(self.window._planned_joint_angles.shape[1], self.window.arm.joint_count)
         self.assertIn(self.window.arm.joint_count, self.window.fixed_nodes)
         np.testing.assert_allclose(
             self.window.arm.forward_kinematics(self.window.joint_angles)[-1],
@@ -288,7 +290,9 @@ class TestDesktopPrototype(unittest.TestCase):
             (np.array([1.2, 1.0]), None, None),
         ]
         self.window.simulation_route_indices = [0, 1]
-        self.window.simulation_duration_control.setValue(0.5)
+        self.window.max_duration_control.setValue(0.5)
+        self.window.max_duration_limit_enabled.setChecked(True)
+        self.window._prepare_simulation()
         self.window._start_simulation()
         self.assertTrue(self.window._simulation_timer.isActive())
         for _ in range(20):
@@ -298,6 +302,11 @@ class TestDesktopPrototype(unittest.TestCase):
         self.assertFalse(self.window._simulation_timer.isActive())
         self.assertAlmostEqual(self.window._simulation_time, 0.5, places=7)
         self.assertIn("完成", self.window.status_label.text())
+        self.assertEqual(len(self.window._simulation_log_torques), len(self.window._simulation_log_times))
+        self.assertEqual(
+            np.asarray(self.window._simulation_log_torques).shape,
+            (len(self.window._simulation_log_times), self.window.arm.joint_count),
+        )
 
     def test_workspace_renders_in_offscreen_mode(self):
         self.window.show()
@@ -742,6 +751,161 @@ class TestDesktopPrototype(unittest.TestCase):
         np.testing.assert_allclose(plot._values("path:1"), [0.0, 1.0, 2.0])
         np.testing.assert_allclose(plot._values("node_speed:1"), [1.0, 1.0, 1.0])
         np.testing.assert_allclose(plot._values("node_ax:1"), [0.0, 0.0, 0.0], atol=1e-10)
+
+
+    def test_plot_can_read_joint_torque_series(self):
+        from simulation_plot import SimulationPlot
+
+        plot = SimulationPlot()
+        times = np.array([0.0, 0.5, 1.0])
+        positions = np.zeros((3, 3, 2))
+        angles = np.zeros((3, 2))
+        torques = np.array([[1.0, -1.0], [2.0, -2.0], [3.0, -3.0]])
+        plot.set_data(times, positions, angles, 0.5, 1.0, torques)
+
+        np.testing.assert_allclose(plot._values("joint_torque:0"), [1.0, 2.0, 3.0])
+        np.testing.assert_allclose(plot._values("joint_torque:1"), [-1.0, -2.0, -3.0])
+        plot.set_configuration("time", ["joint_torque:0"], "shared")
+        plot.resize(640, 320)
+        plot.show()
+        self.application.processEvents()
+        self.assertFalse(plot.grab().isNull())
+        plot.close()
+
+    def test_recorded_static_torques_match_dynamics_model(self):
+        from dynamics import PlanarArmDynamics
+
+        self.window._record_simulation_state(0.0)
+        model = PlanarArmDynamics(
+            self.window.arm.link_lengths,
+            link_masses=self.window._link_masses,
+            payload_mass=self.window._payload_mass,
+        )
+        expected = model.gravity_torques(self.window.joint_angles)
+        self.assertEqual(len(self.window._simulation_log_torques), 1)
+        np.testing.assert_allclose(self.window._simulation_log_torques[0], expected, atol=1e-10)
+        self.assertIn("joint_torque:0", dict(self.window._plot_variables()))
+
+    def test_incremental_torque_updates_match_full_trajectory_reference(self):
+        from dynamics import PlanarArmDynamics
+        from trajectory_dynamics import calculate_trajectory_torques
+
+        times = np.linspace(0.0, 0.7, 8)
+        angles = np.column_stack((
+            0.2 + 0.3 * times + 0.1 * times**2,
+            -0.4 + 0.15 * times - 0.05 * times**2,
+            0.1 - 0.2 * times + 0.08 * times**2,
+        ))
+        model = PlanarArmDynamics(
+            self.window.arm.link_lengths,
+            link_masses=self.window._link_masses,
+            payload_mass=self.window._payload_mass,
+        )
+        for index, time_value in enumerate(times):
+            self.window.joint_angles = angles[index].copy()
+            self.window._record_simulation_state(float(time_value))
+            expected = calculate_trajectory_torques(
+                model, times[:index + 1], angles[:index + 1]
+            )
+            np.testing.assert_allclose(
+                np.asarray(self.window._simulation_log_torques),
+                expected,
+                atol=1e-9,
+                err_msg=f"trajectory prefix length {index + 1}",
+            )
+
+    def test_payload_mass_change_recalculates_recorded_torques(self):
+        self.window._record_simulation_state(0.0)
+        original = np.asarray(self.window._simulation_log_torques[0]).copy()
+
+        self.window._payload_mass_control.setValue(1.0)
+
+        self.assertAlmostEqual(self.window._payload_mass, 1.0)
+        self.assertFalse(np.allclose(self.window._simulation_log_torques[0], original))
+
+    def test_link_count_change_preserves_link_masses_and_rebuilds_controls(self):
+        self.window._link_mass_controls[0].setValue(2.5)
+        self.window.link_count_control.setValue(4)
+        self.window._set_link_count()
+
+        self.assertEqual(len(self.window._link_mass_controls), 4)
+        np.testing.assert_allclose(self.window._link_masses, [2.5, 1.0, 1.0, 1.0])
+        self.assertEqual(self.window._simulation_log_times, [])
+
+    def test_center_of_mass_and_inertia_controls_recalculate_torques(self):
+        self.window._record_simulation_state(0.0)
+        original = np.asarray(self.window._simulation_log_torques[0]).copy()
+
+        self.window._com_fraction_controls[1].setValue(0.25)
+        self.assertAlmostEqual(self.window._com_fractions[1], 0.25)
+        self.assertFalse(np.allclose(self.window._simulation_log_torques[0], original))
+
+        self.window._clear_simulation_log()
+        self.window.joint_angles = np.radians([30.0, -20.0, 15.0])
+        self.window._record_simulation_state(0.0)
+        self.window.joint_angles = np.radians([35.0, -10.0, 20.0])
+        self.window._record_simulation_state(0.1)
+        self.window.joint_angles = np.radians([50.0, 5.0, 25.0])
+        self.window._record_simulation_state(0.2)
+        dynamic_original = np.asarray(self.window._simulation_log_torques).copy()
+
+        self.window._link_inertia_controls[0].setValue(0.25)
+        self.assertAlmostEqual(self.window._link_inertias[0], 0.25)
+        self.assertFalse(np.allclose(self.window._simulation_log_torques, dynamic_original))
+
+    def test_link_count_change_preserves_com_and_inertia_parameters(self):
+        self.window._com_fraction_controls[0].setValue(0.3)
+        self.window._link_inertia_controls[0].setValue(0.2)
+        self.window.link_count_control.setValue(4)
+        self.window._set_link_count()
+
+        self.assertEqual(len(self.window._com_fraction_controls), 4)
+        self.assertEqual(len(self.window._link_inertia_controls), 4)
+        np.testing.assert_allclose(self.window._com_fractions, [0.3, 0.5, 0.5, 0.5])
+        np.testing.assert_allclose(self.window._link_inertias, [0.2, 1 / 12, 1 / 12, 1 / 12], atol=5e-5)
+
+    def _record_test_trajectory(self):
+        times = [0.0, 0.1, 0.2, 0.3]
+        angles = ([0.0, 0.0, 0.0], [0.1, -0.05, 0.02], [0.2, -0.1, 0.04], [0.3, -0.15, 0.06])
+        for time_value, joint_angles in zip(times, angles):
+            self.window.joint_angles = np.asarray(joint_angles, dtype=float)
+            self.window._record_simulation_state(time_value)
+
+    def test_feasibility_check_passes_when_limits_are_generous(self):
+        self._record_test_trajectory()
+        self.window.max_joint_speed_control.setValue(100.0)
+        self.window.max_joint_acceleration_control.setValue(500.0)
+        self.window.max_joint_torque_control.setValue(10000.0)
+
+        self.window._assess_trajectory_feasibility()
+
+        self.assertIn("均未超过设定限值", self.window.feasibility_result_label.text())
+        self.assertIn("各关节峰值与发生时刻", self.window.feasibility_result_label.text())
+        self.assertIn("关节 1：速度", self.window.feasibility_result_label.text())
+
+    def test_feasibility_check_reports_speed_limit_violation(self):
+        self._record_test_trajectory()
+        self.window.speed_limit_enabled.setChecked(True)
+        self.window.max_joint_speed_control.setValue(0.1)
+        self.window.max_joint_acceleration_control.setValue(500.0)
+        self.window.max_joint_torque_control.setValue(10000.0)
+
+        self.window._assess_trajectory_feasibility()
+
+        self.assertIn("超限：角速度", self.window.feasibility_result_label.text())
+        self.assertIn("关节 1", self.window.feasibility_result_label.text())
+
+    def test_feasibility_check_requires_at_least_three_samples(self):
+        self.window._record_simulation_state(0.0)
+
+        self.window._assess_trajectory_feasibility()
+
+        self.assertIn("至少需要 3 个采样点", self.window.feasibility_result_label.text())
+
+    def test_constraint_group_is_always_visible_without_planning_mode_selector(self):
+        self.assertFalse(self.window.constraint_group.isHidden())
+        self.assertFalse(hasattr(self.window, "trajectory_planning_mode"))
+        self.assertTrue(hasattr(self.window, "max_duration_limit_enabled"))
 
 
 if __name__ == "__main__":

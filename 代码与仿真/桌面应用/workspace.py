@@ -399,8 +399,8 @@ class ArmWorkspace(QWidget):
                     self.path_anchor_selected.emit(index)
                     event.accept()
                     return
-            event.accept()
-            return
+            # 点击非路径锚点时继续执行下方的机械臂关节/连杆命中检测，
+            # 这样选点模式开启时也能直接调整姿态。
         if self._trajectory_edit_mode:
             self.setFocus(Qt.FocusReason.MouseFocusReason)
             cursor = event.position()

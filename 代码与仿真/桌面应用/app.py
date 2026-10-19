@@ -6,12 +6,14 @@ import sys
 from pathlib import Path
 
 import numpy as np
+from scipy.interpolate import CubicSpline, PchipInterpolator
 from PySide6.QtCore import QSignalBlocker, Qt, QTimer
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
     QDialogButtonBox,
+    QCheckBox,
     QDockWidget,
     QDoubleSpinBox,
     QComboBox,
@@ -21,6 +23,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QScrollArea,
     QVBoxLayout,
     QWidget,
     QFrame,
@@ -41,6 +44,9 @@ from inverse_kinematics import solve_two_link_ik
 from numerical_ik import solve_n_link_ik, solve_constrained_drag
 from joint_limits import JointLimits, filter_ik_solutions
 from planar_arm import PlanarArm
+from dynamics import PlanarArmDynamics
+from trajectory_dynamics import calculate_trajectory_torques
+from trajectory_planner import plan_cartesian_path
 from workspace import ArmWorkspace
 from path_trajectory import sample_path_by_arclength, parameterize_path
 from simulation_plot import SimulationPlot, AxisSelectionDialog, VARIABLES, variable_key
@@ -55,10 +61,14 @@ class MainWindow(QMainWindow):
         self.resize(1180, 760)
 
         self.arm = PlanarArm([1.0, 1.0, 1.0])
+        self._link_masses = np.ones(self.arm.joint_count, dtype=float)
+        self._com_fractions = np.full(self.arm.joint_count, 0.5, dtype=float)
+        self._link_inertias = self.arm.link_lengths**2 / 12.0
+        self._payload_mass = 0.0
         self.joint_angles = np.radians([90.0, -90.0, 90.0])
         self.joint_limits = JointLimits(
-            [math.radians(-180)] * self.arm.joint_count,
-            [math.radians(180)] * self.arm.joint_count,
+            [math.radians(-180.0)] * self.arm.joint_count,
+            [math.radians(180.0)] * self.arm.joint_count,
         )
         self.target = self.arm.forward_kinematics(self.joint_angles)[-1]
         self.target_status = "valid"
@@ -74,6 +84,13 @@ class MainWindow(QMainWindow):
         self._simulation_log_times = []
         self._simulation_log_positions = []
         self._simulation_log_angles = []
+        self._simulation_log_torques = []
+        self._planned_joint_angles = None
+        self._planned_path_progress = None
+        self._planned_path_spline = None
+        self._planned_cartesian_path = None
+        self._planned_pose_constraints = {}
+        self._anchor_pose_constraints = {}
 
         self._elbow_drag_line_direction = None
         self.workspace = ArmWorkspace(self)
@@ -129,21 +146,89 @@ class MainWindow(QMainWindow):
 
     def _prepare_simulation(self):
         self._simulation_timer.stop()
+        self._simulation_prepared = False
+        self.constraint_result_label.setText("正在搜索满足约束的轨迹……")
         anchors = self._simulation_anchor_points()
         if anchors is None:
-            self._set_status("请先点击“选择路径点”，并按顺序选择至少两个紫色锚点。", "invalid")
+            message = "请先点击“选择路径点”，并按顺序选择至少两个紫色锚点。"
+            self.constraint_result_label.setText(f"规划失败：{message}")
+            self._set_status(message, "invalid")
             return
         try:
-            sampled = sample_path_by_arclength(anchors, sample_count=240)
-            times, points = parameterize_path(sampled, self.simulation_duration_control.value())
+            # 每段路径至少分配 240 个几何采样点，减少相邻关键锚点映射到同一采样点的误报。
+            sampled = sample_path_by_arclength(anchors, sample_count=max(240, 240 * (len(anchors) - 1)), preserve_anchors=True)
+            self._planned_joint_angles = None
+            self._planned_path_progress = None
+            self._planned_path_spline = None
+            self._planned_cartesian_path = None
+            self._planned_pose_constraints = {}
+            current_endpoint = self.arm.forward_kinematics(self.joint_angles)[-1]
+            if np.linalg.norm(current_endpoint - sampled[0]) <= 1e-4:
+                start_angles = self.joint_angles.copy()
+                start_error, start_ok = float(np.linalg.norm(current_endpoint - sampled[0])), True
+            else:
+                start_angles, start_error, start_ok = solve_n_link_ik(
+                    self.arm, sampled[0], self.joint_angles,
+                    limits=self.joint_limits if self._joint_limits_enabled() else None,
+                )
+            if not start_ok:
+                raise ValueError(f"路径起点逆运动学未收敛（误差 {start_error:.3g}），无法自动规划。")
+            model = PlanarArmDynamics(
+                self.arm.link_lengths, link_masses=self._link_masses,
+                center_of_mass_fractions=self._com_fractions,
+                link_inertias=self._link_inertias, payload_mass=self._payload_mass,
+            )
+            max_duration = self.max_duration_control.value() if self.max_duration_limit_enabled.isChecked() else 120.0
+            initial_duration = min(1.0, max_duration)
+            pose_constraints = {0: start_angles.copy()}
+            plan = plan_cartesian_path(
+                model, sampled, start_angles,
+                self.max_joint_speed_control.value() if self.speed_limit_enabled.isChecked() else 1e12,
+                self.max_joint_acceleration_control.value() if self.acceleration_limit_enabled.isChecked() else 1e12,
+                self.max_joint_torque_control.value() if self.torque_limit_enabled.isChecked() else 1e12,
+                initial_duration=initial_duration,
+                sample_count=240, max_duration=max_duration,
+                joint_limits=self.joint_limits if self._joint_limits_enabled() else None,
+                pose_constraints=pose_constraints,
+            )
+            if not plan.success:
+                raise ValueError(plan.message)
+            times = plan.times
+            self._planned_joint_angles = plan.joint_angles
+            self._planned_path_progress = plan.path_progress
+            # 将规划输出的离散关节轨迹构造成连续、保形的时间插值器。
+            # 播放时只采样该插值器，不再逐帧切换 IK 解或硬切关键姿态。
+            self._planned_path_spline = PchipInterpolator(times, plan.joint_angles, axis=0)
+            self._planned_cartesian_path = sampled.copy()
+            self._planned_pose_constraints = {
+                int(index): np.asarray(angles, dtype=float).copy()
+                for index, angles in pose_constraints.items()
+            }
+            # 仿真播放的目标位置直接来自笛卡尔路径，不再由关节空间样条反算末端位置。
+            points = sampled.copy()
+            self._set_status(f"规划成功：总时间 {plan.duration:.2f} s，搜索 {plan.iterations} 次。", "valid")
         except ValueError as exc:
+            self._planned_joint_angles = None
+            self._planned_path_progress = None
+            self._planned_path_spline = None
+            self._planned_cartesian_path = None
+            self._planned_pose_constraints = {}
+            self.constraint_result_label.setText(f"规划失败：{exc}")
             self._set_status(str(exc), "invalid")
             return
+        self.constraint_result_label.setText(f"路径规划成功：总时间 {float(times[-1]):.2f} s；播放时回放规划阶段生成的连续关节轨迹，避免逐帧逆运动学切换构型。")
         self._simulation_times = times
         self._simulation_points = points
         self._simulation_duration = float(times[-1])
         self._simulation_time = 0.0
-        self._on_target_dragged(float(points[0, 0]), float(points[0, 1]))
+        if self._planned_joint_angles is not None:
+            self.joint_angles = self._planned_joint_angles[0].copy()
+            self.target = self.arm.forward_kinematics(self.joint_angles)[-1]
+            self.target_status = "valid"
+            self.workspace.set_state(self.arm.link_lengths, self.joint_angles, self.target, self.target_status, self.fixed_nodes)
+            self._sync_controls()
+        else:
+            self._on_target_dragged(float(points[0, 0]), float(points[0, 1]))
         if self.target_status == "invalid":
             self._set_status("起点不可达，无法准备仿真；请调整起点或机械臂参数。", "invalid")
             return
@@ -187,8 +272,95 @@ class MainWindow(QMainWindow):
             return
         self.simulation_route_indices.append(index)
         self.simulation_path_points_label.setText("路径顺序：" + " → ".join(str(i + 1) for i in self.simulation_route_indices))
+        self._refresh_pose_anchor_options()
         self._simulation_prepared = False
         self.simulation_run_button.setEnabled(False)
+
+    def _refresh_pose_anchor_options(self):
+        if not hasattr(self, "pose_anchor_combo"):
+            return
+        previous = self.pose_anchor_combo.currentData()
+        self.pose_anchor_combo.clear()
+        expanded_route = []
+        for start, end in zip(self.simulation_route_indices, self.simulation_route_indices[1:]):
+            step = 1 if end >= start else -1
+            segment = list(range(start, end + step, step))
+            if expanded_route:
+                segment = segment[1:]
+            expanded_route.extend(segment)
+        available_anchors = list(dict.fromkeys(expanded_route))
+        for route_position, anchor_index in enumerate(available_anchors):
+            self.pose_anchor_combo.addItem(f"路径位置 {route_position + 1}（锚点 {anchor_index + 1}）", (route_position, anchor_index))
+        selected = self.pose_anchor_combo.findData(previous)
+        if selected >= 0:
+            self.pose_anchor_combo.setCurrentIndex(selected)
+        self._refresh_pose_constraint_label()
+
+    def _activate_pose_anchor(self, _index):
+        selected = self.pose_anchor_combo.currentData()
+        if selected is None:
+            return
+        _route_position, anchor_index = selected
+        anchors = self.workspace.path_anchors()
+        if not 0 <= anchor_index < len(anchors):
+            return
+        anchor_point = np.asarray(anchors[anchor_index][0], dtype=float)
+        self._simulation_timer.stop()
+        self._simulation_prepared = False
+        self.simulation_run_button.setEnabled(False)
+        self.fixed_nodes.pop(self.arm.joint_count, None)
+        self._on_target_dragged(float(anchor_point[0]), float(anchor_point[1]))
+        if self.target_status == "invalid":
+            self._set_status(f"锚点 {anchor_index + 1} 当前不可达，未固定末端。", "invalid")
+            return
+        self.target = anchor_point.copy()
+        self.fixed_nodes[self.arm.joint_count] = anchor_point.copy()
+        self.workspace.set_state(self.arm.link_lengths, self.joint_angles, self.target, self.target_status, self.fixed_nodes)
+        self._sync_controls()
+        self._refresh_pose_constraint_label()
+        self._set_status(f"末端已移动并固定在锚点 {anchor_index + 1}。现在可调整其他关节，再记录姿态。", "valid")
+
+    def _refresh_pose_constraint_label(self):
+        if not hasattr(self, "pose_constraints_label"):
+            return
+        if not self._anchor_pose_constraints:
+            self.pose_constraints_label.setText("尚未设置关键姿态；默认使用连续逆运动学解。")
+            return
+        lines = [f"锚点 {index + 1}：" + ", ".join(f"{value:.1f}°" for value in np.degrees(angles)) for index, angles in sorted(self._anchor_pose_constraints.items())]
+        self.pose_constraints_label.setText("已记录姿态（关节角）：\n" + "\n".join(lines))
+
+    def _record_anchor_pose_constraint(self):
+        selected = self.pose_anchor_combo.currentData()
+        if selected is None:
+            self._set_status("请先选择路径点，再记录关键姿态。", "invalid")
+            return
+        _route_position, anchor_index = selected
+        anchors = self.workspace.path_anchors()
+        if not 0 <= anchor_index < len(anchors):
+            self._set_status("所选锚点已不存在，请重新选择路径点。", "invalid")
+            return
+        anchor_point = np.asarray(anchors[anchor_index][0], dtype=float)
+        endpoint = self.arm.forward_kinematics(self.joint_angles)[-1]
+        error = float(np.linalg.norm(endpoint - anchor_point))
+        if error > 1e-4:
+            self._set_status(f"当前姿态不能记录：末端与锚点相差 {error:.4g} m。请先将机械臂末端移动到该锚点。", "invalid")
+            return
+        self._anchor_pose_constraints[anchor_index] = self.joint_angles.copy()
+        self._refresh_pose_constraint_label()
+        self._simulation_prepared = False
+        self.simulation_run_button.setEnabled(False)
+        self._set_status(f"已记录锚点 {anchor_index + 1} 的关键姿态。准备时将作为硬约束检查。", "valid")
+
+    def _clear_anchor_pose_constraint(self):
+        selected = self.pose_anchor_combo.currentData()
+        if selected is None:
+            return
+        _route_position, anchor_index = selected
+        self._anchor_pose_constraints.pop(anchor_index, None)
+        self._refresh_pose_constraint_label()
+        self._simulation_prepared = False
+        self.simulation_run_button.setEnabled(False)
+        self._set_status(f"已清除锚点 {anchor_index + 1} 的关键姿态约束。", "valid")
 
     def _simulation_anchor_points(self):
         anchors = self.workspace.path_anchors()
@@ -234,7 +406,14 @@ class MainWindow(QMainWindow):
         self._simulation_time = 0.0
         self._clear_simulation_log()
         start = self._simulation_points[0]
-        self._on_target_dragged(float(start[0]), float(start[1]))
+        if self._planned_joint_angles is not None:
+            self.joint_angles = self._planned_joint_angles[0].copy()
+            self.target = self.arm.forward_kinematics(self.joint_angles)[-1]
+            self.target_status = "valid"
+            self.workspace.set_state(self.arm.link_lengths, self.joint_angles, self.target, self.target_status, self.fixed_nodes)
+            self._sync_controls()
+        else:
+            self._on_target_dragged(float(start[0]), float(start[1]))
         if self.target_status == "invalid":
             self._set_status("起点姿态当前不可执行，请重新准备。", "invalid")
             self._simulation_prepared = False
@@ -276,6 +455,7 @@ class MainWindow(QMainWindow):
         self._simulation_log_times = []
         self._simulation_log_positions = []
         self._simulation_log_angles = []
+        self._simulation_log_torques = []
         self._refresh_simulation_plot()
 
     def _record_simulation_state(self, time_value):
@@ -284,8 +464,60 @@ class MainWindow(QMainWindow):
         self._simulation_log_times.append(float(time_value))
         self._simulation_log_positions.append(positions.copy())
         self._simulation_log_angles.append(self.joint_angles.copy())
+        self._recalculate_simulation_torques(incremental=True)
         self._refresh_simulation_plot()
         self._refresh_data_table()
+
+    def _recalculate_simulation_torques(self, incremental=False):
+        """根据当前已记录的关节轨迹估计角速度/角加速度并计算力矩。"""
+        sample_count = len(self._simulation_log_times)
+        if sample_count == 0:
+            self._simulation_log_torques = []
+            return
+
+        times = np.asarray(self._simulation_log_times, dtype=float)
+        angles = np.asarray(self._simulation_log_angles, dtype=float)
+        if angles.shape != (sample_count, self.arm.joint_count):
+            self._simulation_log_torques = []
+            return
+
+        model = PlanarArmDynamics(
+            self.arm.link_lengths,
+            link_masses=self._link_masses,
+            center_of_mass_fractions=self._com_fractions,
+            link_inertias=self._link_inertias,
+            payload_mass=self._payload_mass,
+        )
+        if incremental and sample_count > 1 and len(self._simulation_log_torques) == sample_count - 1:
+            window_start = max(0, sample_count - 5)
+            window_torques = calculate_trajectory_torques(
+                model, times[window_start:], angles[window_start:]
+            )
+            if window_start == 0:
+                self._simulation_log_torques = [row.copy() for row in window_torques]
+            else:
+                self._simulation_log_torques.append(window_torques[-1].copy())
+                for index in range(max(0, sample_count - 3), sample_count):
+                    self._simulation_log_torques[index] = window_torques[index - window_start].copy()
+        else:
+            torques = calculate_trajectory_torques(model, times, angles)
+            self._simulation_log_torques = [row.copy() for row in torques]
+
+    def _on_dynamics_parameters_changed(self, _value=None):
+        self._link_masses = np.asarray(
+            [control.value() for control in self._link_mass_controls], dtype=float
+        )
+        self._com_fractions = np.asarray(
+            [control.value() for control in self._com_fraction_controls], dtype=float
+        )
+        self._link_inertias = np.asarray(
+            [control.value() for control in self._link_inertia_controls], dtype=float
+        )
+        self._payload_mass = float(self._payload_mass_control.value())
+        self._recalculate_simulation_torques()
+        self._refresh_simulation_plot()
+        self._refresh_data_table()
+        self.statusBar().showMessage("动力学参数已更新，当前记录轨迹的力矩已重新计算。", 4000)
 
     def _refresh_simulation_plot(self):
         plot = getattr(self, "simulation_plot", None)
@@ -297,6 +529,7 @@ class MainWindow(QMainWindow):
             self._simulation_log_angles,
             self._simulation_time,
             self._simulation_duration,
+            self._simulation_log_torques,
         )
         if self._plot_window is None:
             plot.set_configuration(self._plot_configs[0]["x"], self._plot_configs[0]["ys"], "shared")
@@ -308,7 +541,7 @@ class MainWindow(QMainWindow):
                 self._plot_widgets.append(extra)
                 self._plot_window_layout.addWidget(extra, 1)
             for index, config in enumerate(self._plot_configs):
-                self._plot_widgets[index].set_data(self._simulation_log_times, self._simulation_log_positions, self._simulation_log_angles, self._simulation_time, self._simulation_duration)
+                self._plot_widgets[index].set_data(self._simulation_log_times, self._simulation_log_positions, self._simulation_log_angles, self._simulation_time, self._simulation_duration, self._simulation_log_torques)
                 self._plot_widgets[index].set_configuration(config["x"], config["ys"], "shared")
                 self._plot_widgets[index].chart_title = self._chart_title(config, index + 1)
                 self._plot_widgets[index].update()
@@ -501,7 +734,7 @@ class MainWindow(QMainWindow):
                          "node_ax", "node_ay", "node_accel"):
                 variables.append((variable_key(kind, index), f"{node_name} · {VARIABLES[kind][0]}"))
         for index in range(self.arm.joint_count):
-            for kind in ("joint_angle", "link_angle", "joint_velocity", "joint_accel"):
+            for kind in ("joint_angle", "link_angle", "joint_velocity", "joint_accel", "joint_torque"):
                 variables.append((variable_key(kind, index), f"关节/连杆 {index + 1} · {VARIABLES[kind][0]}"))
         return variables
 
@@ -701,6 +934,75 @@ class MainWindow(QMainWindow):
         add_chart.clicked.connect(self._add_plot_chart)
         self._plot_config_layout.addWidget(add_chart)
 
+    def _assess_trajectory_feasibility(self):
+        """Compare recorded trajectory estimates against user-defined joint limits."""
+        sample_count = len(self._simulation_log_times)
+        if sample_count < 3:
+            message = "数据不足：请先完成一段仿真，至少需要 3 个采样点。"
+            self.feasibility_result_label.setText(message)
+            self._set_status(message, "invalid")
+            return
+
+        times = np.asarray(self._simulation_log_times, dtype=float)
+        angles = np.unwrap(np.asarray(self._simulation_log_angles, dtype=float), axis=0)
+        torques = np.asarray(self._simulation_log_torques, dtype=float)
+        expected_shape = (sample_count, self.arm.joint_count)
+        if angles.shape != expected_shape or torques.shape != expected_shape or not np.all(np.isfinite(times)):
+            message = "检查失败：轨迹数据不完整或包含无效值，请重新运行仿真。"
+            self.feasibility_result_label.setText(message)
+            self._set_status(message, "invalid")
+            return
+        if np.any(np.diff(times) <= 0.0):
+            message = "检查失败：采样时间必须严格递增，请重新运行仿真。"
+            self.feasibility_result_label.setText(message)
+            self._set_status(message, "invalid")
+            return
+
+        edge_order = 2 if sample_count >= 3 else 1
+        velocities = np.gradient(angles, times, axis=0, edge_order=edge_order)
+        accelerations = np.gradient(velocities, times, axis=0, edge_order=edge_order)
+        metrics = []
+        if self.speed_limit_enabled.isChecked():
+            metrics.append(("角速度", np.abs(velocities), float(self.max_joint_speed_control.value()), "rad/s"))
+        if self.acceleration_limit_enabled.isChecked():
+            metrics.append(("角加速度", np.abs(accelerations), float(self.max_joint_acceleration_control.value()), "rad/s²"))
+        if self.torque_limit_enabled.isChecked():
+            metrics.append(("驱动力矩", np.abs(torques), float(self.max_joint_torque_control.value()), "N·m"))
+        violations = []
+        lines = [f"检查采样点：{sample_count}；限值均按绝对值逐关节比较。"]
+        for name, values, limit, unit in metrics:
+            peaks = np.max(values, axis=0)
+            over = np.argwhere(values > limit * (1.0 + 1e-9))
+            if len(over):
+                joint_ids = sorted(set(int(item[1]) + 1 for item in over))
+                violations.append(name)
+                detail = "、".join(f"关节 {index}" for index in joint_ids)
+                lines.append(f"超限：{name}峰值 {float(np.max(peaks)):.3g} {unit}（上限 {limit:g}），涉及{detail}。")
+            else:
+                lines.append(f"通过：{name}最大值 {float(np.max(peaks)):.3g} {unit}（上限 {limit:g}）。")
+        lines.append("各关节峰值与发生时刻：")
+        for joint_index in range(self.arm.joint_count):
+            speed_peak_index = int(np.argmax(np.abs(velocities[:, joint_index])))
+            acceleration_peak_index = int(np.argmax(np.abs(accelerations[:, joint_index])))
+            torque_peak_index = int(np.argmax(np.abs(torques[:, joint_index])))
+            lines.append(
+                f"关节 {joint_index + 1}：速度 {abs(velocities[speed_peak_index, joint_index]):.3g} rad/s "
+                f"@ {times[speed_peak_index]:.3g} s；加速度 "
+                f"{abs(accelerations[acceleration_peak_index, joint_index]):.3g} rad/s² "
+                f"@ {times[acceleration_peak_index]:.3g} s；力矩 "
+                f"{abs(torques[torque_peak_index, joint_index]):.3g} N·m "
+                f"@ {times[torque_peak_index]:.3g} s。"
+            )
+
+        if violations:
+            lines.insert(1, "结论：当前轨迹至少有一项超过设定限值。")
+            self._set_status("轨迹可执行性检查：发现超限项。", "invalid")
+        else:
+            lines.insert(1, "结论：所检查的三项指标均未超过设定限值。")
+            self._set_status("轨迹可执行性检查：当前设定下未发现超限。", "valid")
+        lines.append("注意：角速度和角加速度由离散轨迹数值微分估算；该检查不包含碰撞、摩擦、电机动态或控制误差。可在结果区域内滚动查看完整说明。")
+        self.feasibility_result_label.setText("\n".join(lines))
+
     def _advance_simulation(self):
         if len(self._simulation_times) < 2:
             self._simulation_timer.stop()
@@ -709,10 +1011,33 @@ class MainWindow(QMainWindow):
             self._simulation_duration,
             self._simulation_time + self._simulation_timer.interval() / 1000.0,
         )
-        x = float(np.interp(self._simulation_time, self._simulation_times, self._simulation_points[:, 0]))
-        y = float(np.interp(self._simulation_time, self._simulation_times, self._simulation_points[:, 1]))
-        self._on_target_dragged(x, y)
+        if self._planned_joint_angles is not None:
+            # 规划阶段已生成连续的关节空间轨迹；播放时必须沿用同一轨迹。
+            # 不再逐帧重新求 IK，也不在关键点附近硬切关节角，避免构型分支跳变。
+            sample_angles = self._planned_joint_angles
+            if self._simulation_time >= self._simulation_duration:
+                self.joint_angles = sample_angles[-1].copy()
+            elif self._planned_path_spline is not None:
+                self.joint_angles = np.asarray(
+                    self._planned_path_spline(self._simulation_time), dtype=float
+                )
+            else:
+                self.joint_angles = np.asarray([
+                    np.interp(self._simulation_time, self._simulation_times, sample_angles[:, joint])
+                    for joint in range(self.arm.joint_count)
+                ], dtype=float)
+            self.target = self.arm.forward_kinematics(self.joint_angles)[-1]
+            self.target_status = "valid"
+            self.workspace.set_state(
+                self.arm.link_lengths, self.joint_angles, self.target, self.target_status, self.fixed_nodes
+            )
+            self._sync_controls()
+        else:
+            x = float(np.interp(self._simulation_time, self._simulation_times, self._simulation_points[:, 0]))
+            y = float(np.interp(self._simulation_time, self._simulation_times, self._simulation_points[:, 1]))
+            self._on_target_dragged(x, y)
         if self.target_status == "invalid":
+
             self._simulation_timer.stop()
             self.simulation_pause_button.setEnabled(False)
             self.simulation_stop_button.setEnabled(True)
@@ -735,6 +1060,8 @@ class MainWindow(QMainWindow):
         if enabled:
             self.select_path_points_button.setChecked(False)
             self.simulation_route_indices.clear()
+            self._anchor_pose_constraints.clear()
+            self._refresh_pose_anchor_options()
             self.simulation_path_points_label.setText("轨迹已进入编辑模式，请编辑完成后重新选择路径点。")
             self._simulation_prepared = False
             self.simulation_run_button.setEnabled(False)
@@ -796,15 +1123,33 @@ class MainWindow(QMainWindow):
         self.limit_form = limit_form
         self.lower_controls = []
         self.upper_controls = []
+        self.lower_limit_enabled = []
+        self.upper_limit_enabled = []
         for index in range(self.arm.joint_count):
             lower = self._make_spinbox(-360.0, 360.0, 1, 1.0)
             upper = self._make_spinbox(-360.0, 360.0, 1, 1.0)
+            lower.setValue(-180.0)
+            upper.setValue(180.0)
+            lower_enabled = QCheckBox("启用")
+            upper_enabled = QCheckBox("启用")
+            lower_enabled.setChecked(False)
+            upper_enabled.setChecked(False)
             lower.valueChanged.connect(self._on_limits_changed)
             upper.valueChanged.connect(self._on_limits_changed)
+            lower_enabled.toggled.connect(self._on_limits_changed)
+            upper_enabled.toggled.connect(self._on_limits_changed)
             self.lower_controls.append(lower)
             self.upper_controls.append(upper)
-            limit_form.addRow(f"关节 {index + 1} 下限", lower)
-            limit_form.addRow(f"关节 {index + 1} 上限", upper)
+            self.lower_limit_enabled.append(lower_enabled)
+            self.upper_limit_enabled.append(upper_enabled)
+            lower_row = QHBoxLayout()
+            lower_row.addWidget(lower_enabled)
+            lower_row.addWidget(lower, 1)
+            upper_row = QHBoxLayout()
+            upper_row.addWidget(upper_enabled)
+            upper_row.addWidget(upper, 1)
+            limit_form.addRow(f"关节 {index + 1} 下限", lower_row)
+            limit_form.addRow(f"关节 {index + 1} 上限", upper_row)
         layout.addWidget(limit_group)
 
         status_group = QGroupBox("求解状态")
@@ -832,12 +1177,55 @@ class MainWindow(QMainWindow):
         simulation_layout.addWidget(self.select_path_points_button)
         self.workspace.path_anchor_selected.connect(self._on_path_anchor_selected)
 
-        duration_form = QFormLayout()
-        self.simulation_duration_control = self._make_spinbox(0.5, 120.0, 1, 0.5)
-        self.simulation_duration_control.setValue(5.0)
-        self.simulation_duration_control.setToolTip("从起点运行到终点所用的仿真时间")
-        duration_form.addRow("仿真时长（s）", self.simulation_duration_control)
-        simulation_layout.addLayout(duration_form)
+        self.max_duration_limit_enabled = QCheckBox("启用")
+        self.max_duration_limit_enabled.setChecked(False)
+        self.max_duration_control = self._make_spinbox(0.5, 120.0, 1, 0.5)
+        self.max_duration_control.setValue(5.0)
+        self.max_duration_control.setToolTip("启用后，轨迹必须在该总时间上限内满足其他约束；未启用时最多搜索 120 秒")
+        duration_limit_row = QHBoxLayout()
+        duration_limit_row.addWidget(self.max_duration_limit_enabled)
+        duration_limit_row.addWidget(self.max_duration_control, 1)
+
+        feasibility_group = QGroupBox("约束限制（理想模型）")
+        self.constraint_group = feasibility_group
+        feasibility_layout = QVBoxLayout(feasibility_group)
+        feasibility_form = QFormLayout()
+        self.max_joint_speed_control = self._make_spinbox(0.01, 100.0, 2, 0.1)
+        self.max_joint_speed_control.setValue(3.0)
+        self.max_joint_speed_control.setToolTip("各关节允许的最大绝对角速度，单位 rad/s")
+        self.speed_limit_enabled = QCheckBox("启用")
+        self.speed_limit_enabled.setChecked(False)
+        speed_limit_row = QHBoxLayout()
+        speed_limit_row.addWidget(self.speed_limit_enabled)
+        speed_limit_row.addWidget(self.max_joint_speed_control, 1)
+        feasibility_form.addRow("角速度上限（rad/s）", speed_limit_row)
+        self.max_joint_acceleration_control = self._make_spinbox(0.01, 500.0, 2, 0.5)
+        self.max_joint_acceleration_control.setValue(10.0)
+        self.max_joint_acceleration_control.setToolTip("各关节允许的最大绝对角加速度，单位 rad/s²")
+        self.acceleration_limit_enabled = QCheckBox("启用")
+        self.acceleration_limit_enabled.setChecked(False)
+        acceleration_limit_row = QHBoxLayout()
+        acceleration_limit_row.addWidget(self.acceleration_limit_enabled)
+        acceleration_limit_row.addWidget(self.max_joint_acceleration_control, 1)
+        feasibility_form.addRow("角加速度上限（rad/s²）", acceleration_limit_row)
+        self.max_joint_torque_control = self._make_spinbox(0.01, 10000.0, 2, 0.5)
+        self.max_joint_torque_control.setValue(20.0)
+        self.max_joint_torque_control.setToolTip("各关节允许的最大绝对理论驱动力矩，单位 N·m")
+        self.torque_limit_enabled = QCheckBox("启用")
+        self.torque_limit_enabled.setChecked(False)
+        torque_limit_row = QHBoxLayout()
+        torque_limit_row.addWidget(self.torque_limit_enabled)
+        torque_limit_row.addWidget(self.max_joint_torque_control, 1)
+        feasibility_form.addRow("力矩上限（N·m）", torque_limit_row)
+        feasibility_form.addRow("总时间上限（s）", duration_limit_row)
+        feasibility_layout.addLayout(feasibility_form)
+        self.constraint_result_label = QLabel("点击“准备”后，程序会自动搜索满足已启用约束的轨迹，并说明失败原因。")
+        self.feasibility_result_label = self.constraint_result_label
+        self.constraint_result_label.setWordWrap(True)
+        self.constraint_result_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        feasibility_layout.addWidget(self.constraint_result_label)
+        simulation_layout.addWidget(feasibility_group)
+
         self.simulation_prepare_button = QPushButton("准备")
         self.simulation_prepare_button.clicked.connect(self._prepare_simulation)
         simulation_layout.addWidget(self.simulation_prepare_button)
@@ -878,6 +1266,49 @@ class MainWindow(QMainWindow):
         robot_panel = QWidget(dock)
         robot_layout = QVBoxLayout(robot_panel)
         robot_layout.addWidget(QLabel("固定节点后拖拽其他节点，可通过约束求解协调关节。"))
+
+        dynamics_group = QGroupBox("动力学参数")
+        dynamics_layout = QVBoxLayout(dynamics_group)
+        self._mass_form = QFormLayout()
+        self._link_mass_controls = []
+        for index, mass in enumerate(self._link_masses):
+            control = self._make_spinbox(0.0, 100.0, 2, 0.1)
+            control.setValue(float(mass))
+            control.valueChanged.connect(self._on_dynamics_parameters_changed)
+            self._link_mass_controls.append(control)
+            self._mass_form.addRow(f"第 {index + 1} 段质量（kg）", control)
+        dynamics_layout.addLayout(self._mass_form)
+
+        self._com_form = QFormLayout()
+        self._com_fraction_controls = []
+        for index, fraction in enumerate(self._com_fractions):
+            control = self._make_spinbox(0.0, 1.0, 3, 0.05)
+            control.setValue(float(fraction))
+            control.setToolTip("质心沿连杆轴线的位置比例：0 为近端关节，1 为远端端点")
+            control.valueChanged.connect(self._on_dynamics_parameters_changed)
+            self._com_fraction_controls.append(control)
+            self._com_form.addRow(f"第 {index + 1} 段质心比例", control)
+        dynamics_layout.addLayout(self._com_form)
+
+        self._inertia_form = QFormLayout()
+        self._link_inertia_controls = []
+        for index, inertia in enumerate(self._link_inertias):
+            control = self._make_spinbox(0.0, 10000.0, 4, 0.01)
+            control.setValue(float(inertia))
+            control.setToolTip("连杆绕自身质心的平面转动惯量，单位 kg·m²")
+            control.valueChanged.connect(self._on_dynamics_parameters_changed)
+            self._link_inertia_controls.append(control)
+            self._inertia_form.addRow(f"第 {index + 1} 段转动惯量（kg·m²）", control)
+        dynamics_layout.addLayout(self._inertia_form)
+
+        payload_form = QFormLayout()
+        self._payload_mass_control = self._make_spinbox(0.0, 100.0, 2, 0.1)
+        self._payload_mass_control.setValue(self._payload_mass)
+        self._payload_mass_control.valueChanged.connect(self._on_dynamics_parameters_changed)
+        payload_form.addRow("末端负载质量（kg）", self._payload_mass_control)
+        dynamics_layout.addLayout(payload_form)
+        dynamics_layout.addWidget(QLabel("质心默认位于连杆中点，连杆按均匀细杆估算转动惯量。力矩是理想刚体模型的估计值。"))
+        robot_layout.addWidget(dynamics_group)
         robot_layout.addStretch(1)
         self._panel_pages["robot"] = robot_panel
         self._panel_stack.addWidget(robot_panel)
@@ -902,14 +1333,23 @@ class MainWindow(QMainWindow):
         count = int(self.link_count_control.value())
         old_count = self.arm.joint_count
         old_lengths = self.arm.link_lengths.copy()
+        old_masses = self._link_masses.copy()
+        old_com_fractions = self._com_fractions.copy()
+        old_inertias = self._link_inertias.copy()
         old_angles = self.joint_angles.copy()
-        old_lower = self.joint_limits.lower.copy()
-        old_upper = self.joint_limits.upper.copy()
+        old_lower = np.radians([control.value() for control in self.lower_controls])
+        old_upper = np.radians([control.value() for control in self.upper_controls])
+        old_lower_enabled = [control.isChecked() for control in self.lower_limit_enabled]
+        old_upper_enabled = [control.isChecked() for control in self.upper_limit_enabled]
 
         lengths = [
             float(old_lengths[index]) if index < old_count else 1.0
             for index in range(count)
         ]
+        masses = np.asarray([
+            float(old_masses[index]) if index < old_count else 1.0
+            for index in range(count)
+        ])
         angles = np.radians([90.0 if index % 2 == 0 else -90.0 for index in range(count)])
         lower = np.full(count, math.radians(-180))
         upper = np.full(count, math.radians(180))
@@ -924,12 +1364,23 @@ class MainWindow(QMainWindow):
             self.limit_form.removeRow(0)
 
         self.arm = PlanarArm(lengths)
+        self._link_masses = masses
+        self._com_fractions = np.asarray([
+            old_com_fractions[index] if index < old_count else 0.5
+            for index in range(count)
+        ], dtype=float)
+        self._link_inertias = np.asarray([
+            old_inertias[index] if index < old_count else masses[index] * lengths[index] ** 2 / 12.0
+            for index in range(count)
+        ], dtype=float)
         self.joint_angles = angles
         self.joint_limits = JointLimits(lower, upper)
         self.fixed_nodes.clear()
         self.link_controls = []
         self.lower_controls = []
         self.upper_controls = []
+        self.lower_limit_enabled = []
+        self.upper_limit_enabled = []
 
         for index, length in enumerate(lengths):
             control = self._make_spinbox(0.1, 10.0, 2, 0.1)
@@ -941,18 +1392,64 @@ class MainWindow(QMainWindow):
         for index in range(count):
             lower_control = self._make_spinbox(-360.0, 360.0, 1, 1.0)
             upper_control = self._make_spinbox(-360.0, 360.0, 1, 1.0)
-            lower_control.setValue(float(np.degrees(lower[index])))
-            upper_control.setValue(float(np.degrees(upper[index])))
+            lower_control.setValue(float(np.degrees(old_lower[index])) if index < old_count else -180.0)
+            upper_control.setValue(float(np.degrees(old_upper[index])) if index < old_count else 180.0)
+            lower_enabled = QCheckBox("启用")
+            upper_enabled = QCheckBox("启用")
+            lower_enabled.setChecked(old_lower_enabled[index] if index < old_count else False)
+            upper_enabled.setChecked(old_upper_enabled[index] if index < old_count else False)
             lower_control.valueChanged.connect(self._on_limits_changed)
             upper_control.valueChanged.connect(self._on_limits_changed)
+            lower_enabled.toggled.connect(self._on_limits_changed)
+            upper_enabled.toggled.connect(self._on_limits_changed)
             self.lower_controls.append(lower_control)
             self.upper_controls.append(upper_control)
-            self.limit_form.addRow(f"关节 {index + 1} 下限", lower_control)
-            self.limit_form.addRow(f"关节 {index + 1} 上限", upper_control)
+            self.lower_limit_enabled.append(lower_enabled)
+            self.upper_limit_enabled.append(upper_enabled)
+            lower_row = QHBoxLayout()
+            lower_row.addWidget(lower_enabled)
+            lower_row.addWidget(lower_control, 1)
+            upper_row = QHBoxLayout()
+            upper_row.addWidget(upper_enabled)
+            upper_row.addWidget(upper_control, 1)
+            self.limit_form.addRow(f"关节 {index + 1} 下限", lower_row)
+            self.limit_form.addRow(f"关节 {index + 1} 上限", upper_row)
 
+        while self._mass_form.rowCount():
+            self._mass_form.removeRow(0)
+        self._link_mass_controls = []
+        for index, mass in enumerate(self._link_masses):
+            control = self._make_spinbox(0.0, 100.0, 2, 0.1)
+            control.setValue(float(mass))
+            control.valueChanged.connect(self._on_dynamics_parameters_changed)
+            self._link_mass_controls.append(control)
+            self._mass_form.addRow(f"第 {index + 1} 段质量（kg）", control)
+
+        for form, controls, values, label, minimum, maximum, decimals, step, tooltip in (
+            (self._com_form, "_com_fraction_controls", self._com_fractions, "质心比例", 0.0, 1.0, 3, 0.05,
+             "质心沿连杆轴线的位置比例：0 为近端关节，1 为远端端点"),
+            (self._inertia_form, "_link_inertia_controls", self._link_inertias, "转动惯量（kg·m²）", 0.0, 10000.0, 4, 0.01,
+             "连杆绕自身质心的平面转动惯量，单位 kg·m²"),
+        ):
+            while form.rowCount():
+                form.removeRow(0)
+            new_controls = []
+            for index, value in enumerate(values):
+                control = self._make_spinbox(minimum, maximum, decimals, step)
+                control.setValue(float(value))
+                control.setToolTip(tooltip)
+                control.valueChanged.connect(self._on_dynamics_parameters_changed)
+                new_controls.append(control)
+                form.addRow(f"第 {index + 1} 段{label}", control)
+            setattr(self, controls, new_controls)
+
+        self._simulation_prepared = False
+        self._simulation_timer.stop()
+        self._clear_simulation_log()
         self.target = self.arm.forward_kinematics(self.joint_angles)[-1]
         self.target_status = "valid"
         self._sync_controls()
+        self._on_limits_changed(0)
         self._refresh_workspace()
         self._set_status(f"机械臂已调整为 {count} 段，保留了原有可用参数。", "valid")
 
@@ -960,8 +1457,6 @@ class MainWindow(QMainWindow):
         self._updating_controls = True
         controls = []
         controls.extend(zip(self.link_controls, self.arm.link_lengths))
-        controls.extend(zip(self.lower_controls, np.degrees(self.joint_limits.lower)))
-        controls.extend(zip(self.upper_controls, np.degrees(self.joint_limits.upper)))
         blockers = [QSignalBlocker(control) for control, _ in controls]
         for control, value in controls:
             control.setValue(float(value))
@@ -979,6 +1474,9 @@ class MainWindow(QMainWindow):
         self.target = self.arm.forward_kinematics(self.joint_angles)[-1]
         self._update_pose_status()
         self._refresh_workspace()
+        self._recalculate_simulation_torques()
+        self._refresh_simulation_plot()
+        self._refresh_data_table()
 
     def _on_angles_changed(self, _value):
         if self._updating_controls:
@@ -988,11 +1486,25 @@ class MainWindow(QMainWindow):
         self._update_pose_status()
         self._refresh_workspace()
 
+    def _joint_limits_enabled(self):
+        return any(
+            control.isChecked()
+            for control in (*self.lower_limit_enabled, *self.upper_limit_enabled)
+        )
+
     def _on_limits_changed(self, _value):
         if self._updating_controls:
             return
-        lower = np.radians([control.value() for control in self.lower_controls])
-        upper = np.radians([control.value() for control in self.upper_controls])
+        lower_degrees = [
+            control.value() if enabled.isChecked() else -1e9
+            for control, enabled in zip(self.lower_controls, self.lower_limit_enabled)
+        ]
+        upper_degrees = [
+            control.value() if enabled.isChecked() else 1e9
+            for control, enabled in zip(self.upper_controls, self.upper_limit_enabled)
+        ]
+        lower = np.radians(lower_degrees)
+        upper = np.radians(upper_degrees)
         try:
             self.joint_limits = JointLimits(lower, upper)
         except ValueError as exc:

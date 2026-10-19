@@ -3,7 +3,7 @@
 import numpy as np
 
 
-def sample_path_by_arclength(anchors, sample_count=200, samples_per_segment=40):
+def sample_path_by_arclength(anchors, sample_count=200, samples_per_segment=40, *, preserve_anchors=False):
     """采样锚点路径，返回按弧长近似均匀分布的二维点阵。
 
     anchors 中每项为 (point, incoming_handle, outgoing_handle)，控制柄为相对向量。
@@ -51,6 +51,10 @@ def sample_path_by_arclength(anchors, sample_count=200, samples_per_segment=40):
         return np.repeat(dense[:1], sample_count, axis=0)
 
     target_distances = np.linspace(0.0, total_length, sample_count)
+    if preserve_anchors:
+        anchor_indices = np.arange(1, len(points) - 1) * samples_per_segment
+        anchor_distances = cumulative[anchor_indices]
+        target_distances = np.unique(np.concatenate((target_distances, anchor_distances)))
     sampled = np.column_stack([
         np.interp(target_distances, cumulative, dense[:, axis])
         for axis in range(2)
