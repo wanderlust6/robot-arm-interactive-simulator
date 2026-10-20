@@ -1,0 +1,181 @@
+{
+  "experiment_root": "D:\\Project\\机械臂交互式仿真平台\\数据与实验\\奇异位形附近DLS基线实验",
+  "repeat": 3,
+  "solver": "solve_n_link_ik; fixed initial damping 1e-3",
+  "scenarios": [
+    {
+      "scenario": "01_参考姿态",
+      "target_q2_deg": null,
+      "reference_samples": 480,
+      "reference_min_singular_value": 0.09645754890686034,
+      "reference_singular_sample_count": 0,
+      "runs": [
+        {
+          "run": 1,
+          "samples": 480,
+          "failed_samples": 0,
+          "success_rate": 1.0,
+          "total_solve_time_s": 0.055258199929085094,
+          "mean_solve_time_ms": 0.11512124985226062,
+          "p95_solve_time_ms": 0.16542000066692705,
+          "max_endpoint_error_m": 9.837716408300803e-07,
+          "p95_endpoint_error_m": 7.635496407265742e-07,
+          "max_joint_step_rad": 0.0056340560665446215,
+          "min_singular_value_on_solution": 0.09645790137120681,
+          "max_finite_condition_number": 10.901478869326775
+        },
+        {
+          "run": 2,
+          "samples": 480,
+          "failed_samples": 0,
+          "success_rate": 1.0,
+          "total_solve_time_s": 0.051912700037064496,
+          "mean_solve_time_ms": 0.10815145841055103,
+          "p95_solve_time_ms": 0.15073500162543493,
+          "max_endpoint_error_m": 9.837716408300803e-07,
+          "p95_endpoint_error_m": 7.635496407265742e-07,
+          "max_joint_step_rad": 0.0056340560665446215,
+          "min_singular_value_on_solution": 0.09645790137120681,
+          "max_finite_condition_number": 10.901478869326775
+        },
+        {
+          "run": 3,
+          "samples": 480,
+          "failed_samples": 0,
+          "success_rate": 1.0,
+          "total_solve_time_s": 0.0492524000328558,
+          "mean_solve_time_ms": 0.10260916673511626,
+          "p95_solve_time_ms": 0.13321499918674817,
+          "max_endpoint_error_m": 9.837716408300803e-07,
+          "p95_endpoint_error_m": 7.635496407265742e-07,
+          "max_joint_step_rad": 0.0056340560665446215,
+          "min_singular_value_on_solution": 0.09645790137120681,
+          "max_finite_condition_number": 10.901478869326775
+        }
+      ],
+      "notes": [
+        "成功率统计当前 solve_n_link_ik 对离散路径点的逐点求解结果。",
+        "耗时受计算机负载影响，建议重复运行后比较分布。",
+        "奇异性指标基于末端位置雅可比矩阵；条件数可能为无穷大。",
+        "当前求解器不返回迭代次数，因此不统计迭代次数。",
+        "这是软件仿真基线，不是实体机械臂测量数据。"
+      ]
+    },
+    {
+      "scenario": "02_接近奇异",
+      "target_q2_deg": null,
+      "reference_samples": 480,
+      "reference_min_singular_value": 0.019440269179025856,
+      "reference_singular_sample_count": 0,
+      "runs": [
+        {
+          "run": 1,
+          "samples": 480,
+          "failed_samples": 0,
+          "success_rate": 1.0,
+          "total_solve_time_s": 0.053549600081169046,
+          "mean_solve_time_ms": 0.11156166683576885,
+          "p95_solve_time_ms": 0.15172499824984695,
+          "max_endpoint_error_m": 9.453963659274452e-07,
+          "p95_endpoint_error_m": 7.212500813386832e-07,
+          "max_joint_step_rad": 0.010536701226229118,
+          "min_singular_value_on_solution": 0.019442635403922916,
+          "max_finite_condition_number": 55.34274346642871
+        },
+        {
+          "run": 2,
+          "samples": 480,
+          "failed_samples": 0,
+          "success_rate": 1.0,
+          "total_solve_time_s": 0.05223049998676288,
+          "mean_solve_time_ms": 0.10881354163908934,
+          "p95_solve_time_ms": 0.14380999982677167,
+          "max_endpoint_error_m": 9.453963659274452e-07,
+          "p95_endpoint_error_m": 7.212500813386832e-07,
+          "max_joint_step_rad": 0.010536701226229118,
+          "min_singular_value_on_solution": 0.019442635403922916,
+          "max_finite_condition_number": 55.34274346642871
+        },
+        {
+          "run": 3,
+          "samples": 480,
+          "failed_samples": 0,
+          "success_rate": 1.0,
+          "total_solve_time_s": 0.057020500011276454,
+          "mean_solve_time_ms": 0.11879270835682594,
+          "p95_solve_time_ms": 0.15935500141495135,
+          "max_endpoint_error_m": 9.453963659274452e-07,
+          "p95_endpoint_error_m": 7.212500813386832e-07,
+          "max_joint_step_rad": 0.010536701226229118,
+          "min_singular_value_on_solution": 0.019442635403922916,
+          "max_finite_condition_number": 55.34274346642871
+        }
+      ],
+      "notes": [
+        "成功率统计当前 solve_n_link_ik 对离散路径点的逐点求解结果。",
+        "耗时受计算机负载影响，建议重复运行后比较分布。",
+        "奇异性指标基于末端位置雅可比矩阵；条件数可能为无穷大。",
+        "当前求解器不返回迭代次数，因此不统计迭代次数。",
+        "这是软件仿真基线，不是实体机械臂测量数据。"
+      ]
+    },
+    {
+      "scenario": "03_完全伸直",
+      "target_q2_deg": null,
+      "reference_samples": 480,
+      "reference_min_singular_value": 0.0004900240109507746,
+      "reference_singular_sample_count": 0,
+      "runs": [
+        {
+          "run": 1,
+          "samples": 480,
+          "failed_samples": 0,
+          "success_rate": 1.0,
+          "total_solve_time_s": 0.05640899998979876,
+          "mean_solve_time_ms": 0.11751874997874741,
+          "p95_solve_time_ms": 0.16720999992685392,
+          "max_endpoint_error_m": 9.917186596448377e-07,
+          "p95_endpoint_error_m": 7.428357535573463e-07,
+          "max_joint_step_rad": 0.012722471548420612,
+          "min_singular_value_on_solution": 0.0006732838610701388,
+          "max_finite_condition_number": 1599.6696135295294
+        },
+        {
+          "run": 2,
+          "samples": 480,
+          "failed_samples": 0,
+          "success_rate": 1.0,
+          "total_solve_time_s": 0.053729099985503126,
+          "mean_solve_time_ms": 0.11193562496979818,
+          "p95_solve_time_ms": 0.15071000143507263,
+          "max_endpoint_error_m": 9.917186596448377e-07,
+          "p95_endpoint_error_m": 7.428357535573463e-07,
+          "max_joint_step_rad": 0.012722471548420612,
+          "min_singular_value_on_solution": 0.0006732838610701388,
+          "max_finite_condition_number": 1599.6696135295294
+        },
+        {
+          "run": 3,
+          "samples": 480,
+          "failed_samples": 0,
+          "success_rate": 1.0,
+          "total_solve_time_s": 0.05358629997135722,
+          "mean_solve_time_ms": 0.11163812494032754,
+          "p95_solve_time_ms": 0.15279999861377283,
+          "max_endpoint_error_m": 9.917186596448377e-07,
+          "p95_endpoint_error_m": 7.428357535573463e-07,
+          "max_joint_step_rad": 0.012722471548420612,
+          "min_singular_value_on_solution": 0.0006732838610701388,
+          "max_finite_condition_number": 1599.6696135295294
+        }
+      ],
+      "notes": [
+        "成功率统计当前 solve_n_link_ik 对离散路径点的逐点求解结果。",
+        "耗时受计算机负载影响，建议重复运行后比较分布。",
+        "奇异性指标基于末端位置雅可比矩阵；条件数可能为无穷大。",
+        "当前求解器不返回迭代次数，因此不统计迭代次数。",
+        "这是软件仿真基线，不是实体机械臂测量数据。"
+      ]
+    }
+  ]
+}

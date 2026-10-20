@@ -1,17 +1,21 @@
 import os
+import tempfile
 import unittest
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import numpy as np
 from PySide6.QtCore import QPoint, Qt
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QScrollArea
 
 from app import MainWindow, _unwrap_angle_near
-from path_trajectory import sample_path_by_arclength, parameterize_path
+from path_trajectory import sample_path_by_arclength, parameterize_path, find_sharp_corner_indices
 from elbow_drag import solve_elbow_drag_candidates
 from joint_limits import JointLimits
+from simulation_plot import SimulationPlot
+from experiment_io import write_experiment_package
 
 
 class TestDesktopPrototype(unittest.TestCase):
@@ -33,6 +37,66 @@ class TestDesktopPrototype(unittest.TestCase):
         self.window.workspace.set_state(
             self.window.arm.link_lengths, self.window.joint_angles, self.window.target, "valid"
         )
+
+    def test_experiment_package_load_restores_parameters_and_recorded_data(self):
+        config = self.window._experiment_configuration()
+        angles = np.array([[0.0, 0.1, -0.2], [0.1, 0.0, -0.1]])
+        positions = np.array([
+            self.window.arm.forward_kinematics(row) for row in angles
+        ])
+        with tempfile.TemporaryDirectory() as directory:
+            write_experiment_package(
+                directory, config, [0.0, 0.1], positions, angles,
+                np.zeros_like(angles), np.zeros_like(angles), np.zeros_like(angles),
+            )
+            with patch("app.QFileDialog.getOpenFileName", return_value=(str(__import__("pathlib").Path(directory) / "experiment.json"), "experiment.json")):
+                self.window._load_experiment_package()
+        self.assertEqual(len(self.window._simulation_log_times), 2)
+        np.testing.assert_allclose(self.window._simulation_log_angles, angles)
+        np.testing.assert_allclose(self.window._simulation_log_positions, positions)
+        np.testing.assert_allclose(self.window.arm.link_lengths, config["model"]["link_lengths_m"])
+        self.assertFalse(self.window._simulation_prepared)
+        self.assertIsNone(self.window._planned_path_spline)
+        self.assertEqual(self.window.simulation_route_indices, config["trajectory"]["selected_route_indices"])
+        self.assertEqual(
+            self.window.speed_limit_enabled.isChecked(),
+            config["constraints"]["joint_speed"]["enabled"],
+        )
+        self.assertIn("已加载实验包", self.window.statusBar().currentMessage())
+
+    def test_experiment_configuration_captures_model_constraints_and_path(self):
+        config = self.window._experiment_configuration()
+        self.assertEqual(config["model"]["link_lengths_m"], [1.0, 1.0, 1.0])
+        self.assertEqual(len(config["model"]["joint_angles_rad"]), 3)
+        self.assertIn("joint_speed", config["constraints"])
+        self.assertIn("anchors", config["trajectory"])
+        self.assertEqual(config["simulation"]["recorded_samples"], 0)
+        self.window.speed_limit_enabled.setChecked(True)
+        updated = self.window._experiment_configuration()
+        self.assertTrue(updated["constraints"]["joint_speed"]["enabled"])
+
+    def test_plot_click_selects_nearest_curve_point_and_stores_coordinates(self):
+        plot = SimulationPlot()
+        plot.resize(640, 360)
+        plot.set_configuration("time", ["node_x:0"], "shared")
+        times = np.array([0.0, 1.0, 2.0])
+        positions = np.array([[[0.0, 0.0]], [[1.0, 0.0]], [[2.0, 0.0]]])
+        plot.set_data(times, positions, np.zeros((3, 1)), 0.0, 2.0)
+        plot.show()
+        self.application.processEvents()
+        self.assertEqual(len(plot._drawn_points), 3)
+        px, py, expected_x, expected_y, _ = plot._drawn_points[1]
+        QTest.mouseClick(plot, Qt.MouseButton.LeftButton, pos=QPoint(px, py))
+        self.application.processEvents()
+        self.assertIsNotNone(plot._selected_point)
+        self.assertAlmostEqual(plot._selected_point[2], expected_x)
+        self.assertAlmostEqual(plot._selected_point[3], expected_y)
+        second = plot._drawn_points[2]
+        QTest.mouseClick(plot, Qt.MouseButton.LeftButton, pos=QPoint(second[0], second[1]))
+        self.application.processEvents()
+        self.assertAlmostEqual(plot._selected_point[2], second[2])
+        self.assertAlmostEqual(plot._selected_point[3], second[3])
+        plot.close()
 
     def test_link_count_can_be_increased_and_decreased(self):
         self.window.link_count_control.setValue(6)
@@ -58,6 +122,32 @@ class TestDesktopPrototype(unittest.TestCase):
         self.assertEqual(len(self.window.upper_controls), 3)
         np.testing.assert_allclose(np.degrees(self.window.joint_angles), [90.0, -90.0, 90.0])
         self.assertTrue(all(abs(float(length) - 1.0) < 1e-12 for length in self.window.arm.link_lengths))
+
+    def test_first_link_can_cross_minus_180_during_preparation_with_limits_disabled(self):
+        from planar_arm import PlanarArm
+
+        self.window.arm = PlanarArm([1.0, 1.0, 1.0])
+        self.window.joint_angles = np.deg2rad([-179.0, -90.0, 90.0])
+        self.window.joint_limits = JointLimits(
+            np.full(3, -np.deg2rad(1e9)), np.full(3, np.deg2rad(1e9))
+        )
+        self.assertFalse(self.window._joint_limits_enabled())
+        self.assertIsNone(self.window._effective_joint_limits())
+        endpoint = self.window.arm.forward_kinematics(self.window.joint_angles)[-1]
+        self.window.target = endpoint.copy()
+        self.window.fixed_nodes = {3: endpoint.copy()}
+        self.window.workspace.set_state(
+            self.window.arm.link_lengths, self.window.joint_angles,
+            self.window.target, "valid", self.window.fixed_nodes,
+        )
+        target_angle = np.deg2rad(179.0)
+        target = np.array([np.cos(target_angle), np.sin(target_angle)])
+        self.window._on_intermediate_joint_dragged(1, float(target[0]), float(target[1]))
+        self.assertLess(self.window.joint_angles[0], -np.pi, self.window.status_label.text())
+        np.testing.assert_allclose(
+            self.window.arm.forward_kinematics(self.window.joint_angles)[-1],
+            endpoint, atol=1e-5,
+        )
 
     def test_angle_representation_stays_continuous_across_pi_boundary(self):
         previous = np.deg2rad(179.0)
@@ -295,7 +385,8 @@ class TestDesktopPrototype(unittest.TestCase):
         self.window._prepare_simulation()
         self.window._start_simulation()
         self.assertTrue(self.window._simulation_timer.isActive())
-        for _ in range(20):
+        max_steps = int(np.ceil(self.window._simulation_duration * 1000 / self.window._simulation_timer.interval())) + 2
+        for _ in range(max_steps):
             if not self.window._simulation_timer.isActive():
                 break
             self.window._advance_simulation()
@@ -736,6 +827,28 @@ class TestDesktopPrototype(unittest.TestCase):
         self.assertIn("node_speed:3", options)
         self.assertIn("joint_velocity:1", options)
 
+    def test_plot_window_keeps_fixed_size_and_scrolls_when_charts_are_added(self):
+        self.window._open_plot_window()
+        self.window._plot_window.resize(800, 500)
+        self.application.processEvents()
+        initial_size = self.window._plot_window.size()
+        self.assertIsInstance(self.window._plot_scroll_area, QScrollArea)
+        self.assertTrue(self.window._plot_scroll_area.widgetResizable())
+
+        for _ in range(5):
+            self.window._add_plot_chart()
+        self.application.processEvents()
+
+        self.assertEqual(self.window._plot_window.size(), initial_size)
+        self.assertEqual(len(self.window._plot_widgets), 6)
+        self.assertIs(self.window._plot_scroll_area.widget(), self.window._plot_charts_container)
+        self.assertEqual(self.window._plot_charts_layout.count(), 6)
+        self.assertGreater(
+            self.window._plot_scroll_area.verticalScrollBar().maximum(), 0,
+            "多个图表超出可视区域时，应出现可用的纵向滚动范围",
+        )
+        self.window._plot_window.close()
+
     def test_plot_computes_endpoint_path_length_and_node_speed(self):
         from simulation_plot import SimulationPlot
 
@@ -906,6 +1019,28 @@ class TestDesktopPrototype(unittest.TestCase):
         self.assertFalse(self.window.constraint_group.isHidden())
         self.assertFalse(hasattr(self.window, "trajectory_planning_mode"))
         self.assertTrue(hasattr(self.window, "max_duration_limit_enabled"))
+
+
+class SharpCornerDetectionTests(unittest.TestCase):
+    def test_detects_right_angle_corner_without_changing_samples(self):
+        anchors = [
+            (np.array([0.0, 0.0]), None, None),
+            (np.array([1.0, 0.0]), None, None),
+            (np.array([1.0, 1.0]), None, None),
+        ]
+        sampled = sample_path_by_arclength(anchors, sample_count=20, preserve_anchors=True)
+        corners = find_sharp_corner_indices(anchors, sampled)
+        self.assertEqual(len(corners), 1)
+        np.testing.assert_allclose(sampled[corners[0]], [1.0, 0.0], atol=1e-10)
+
+    def test_does_not_stop_at_collinear_anchor(self):
+        anchors = [
+            (np.array([0.0, 0.0]), None, None),
+            (np.array([1.0, 0.0]), None, None),
+            (np.array([2.0, 0.0]), None, None),
+        ]
+        sampled = sample_path_by_arclength(anchors, sample_count=20, preserve_anchors=True)
+        self.assertEqual(find_sharp_corner_indices(anchors, sampled), ())
 
 
 if __name__ == "__main__":

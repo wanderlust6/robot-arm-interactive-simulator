@@ -64,6 +64,37 @@ def sample_path_by_arclength(anchors, sample_count=200, samples_per_segment=40, 
     return sampled
 
 
+def find_sharp_corner_indices(anchors, sampled_points, angle_tolerance_degrees=1.0):
+    """返回采样路径中方向不连续的内部锚点索引，不改变任何路径点。"""
+    sampled = np.asarray(sampled_points, dtype=float)
+    if sampled.ndim != 2 or sampled.shape[1] != 2 or len(sampled) < 2:
+        raise ValueError("sampled_points 必须是至少包含两个二维点的数组")
+    if not np.isfinite(angle_tolerance_degrees) or not 0 <= angle_tolerance_degrees < 180:
+        raise ValueError("角度容差必须在 [0, 180) 度范围内")
+    corners = []
+    tolerance = np.cos(np.radians(angle_tolerance_degrees))
+    for index in range(1, len(anchors) - 1):
+        point, incoming, outgoing = anchors[index]
+        previous = np.asarray(anchors[index - 1][0], dtype=float)
+        current = np.asarray(point, dtype=float)
+        following = np.asarray(anchors[index + 1][0], dtype=float)
+        incoming_tangent = -np.asarray(incoming, dtype=float) if incoming is not None else current - previous
+        outgoing_tangent = np.asarray(outgoing, dtype=float) if outgoing is not None else following - current
+        incoming_norm = float(np.linalg.norm(incoming_tangent))
+        outgoing_norm = float(np.linalg.norm(outgoing_tangent))
+        if incoming_norm <= 1e-12 or outgoing_norm <= 1e-12:
+            raise ValueError(f"路径锚点 {index + 1} 的切向量长度为零，无法可靠判断拐点")
+        cosine = float(np.dot(incoming_tangent, outgoing_tangent) / (incoming_norm * outgoing_norm))
+        if cosine < tolerance:
+            sample_index = int(np.argmin(np.linalg.norm(sampled - current, axis=1)))
+            if sample_index in (0, len(sampled) - 1):
+                continue
+            if np.linalg.norm(sampled[sample_index] - current) > 1e-8:
+                raise ValueError(f"路径锚点 {index + 1} 未被精确保留在采样路径中")
+            corners.append(sample_index)
+    return tuple(sorted(set(corners)))
+
+
 def parameterize_path(points, duration):
     """为路径采样点生成等间隔时间戳。"""
     points = np.asarray(points, dtype=float)

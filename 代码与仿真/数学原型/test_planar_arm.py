@@ -85,6 +85,36 @@ class TestPlanarArmJacobian(unittest.TestCase):
 
         self.assertGreater(abs(determinant), 1e-3)
 
+    def test_singularity_metrics_detect_straight_pose(self):
+        arm = PlanarArm([1.0, 1.0])
+
+        metrics = arm.singularity_metrics([0.0, 0.0])
+
+        self.assertEqual(metrics["rank"], 1)
+        self.assertEqual(metrics["max_rank"], 2)
+        self.assertTrue(metrics["is_singular"])
+        self.assertAlmostEqual(metrics["min_singular_value"], 0.0, places=12)
+        self.assertTrue(np.isinf(metrics["condition_number"]))
+
+    def test_singularity_metrics_detect_bent_pose(self):
+        arm = PlanarArm([1.0, 1.0])
+
+        metrics = arm.singularity_metrics([0.2, 0.8])
+
+        self.assertEqual(metrics["rank"], 2)
+        self.assertFalse(metrics["is_singular"])
+        self.assertGreater(metrics["min_singular_value"], 0.0)
+        self.assertTrue(np.isfinite(metrics["condition_number"]))
+
+    def test_one_joint_arm_uses_its_own_maximum_rank(self):
+        arm = PlanarArm([1.0])
+
+        metrics = arm.singularity_metrics([0.0])
+
+        self.assertEqual(metrics["rank"], 1)
+        self.assertEqual(metrics["max_rank"], 1)
+        self.assertFalse(metrics["is_singular"])
+
 
 class TestPlanarArmInputValidation(unittest.TestCase):
     def test_rejects_empty_link_lengths(self):

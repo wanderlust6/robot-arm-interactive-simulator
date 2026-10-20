@@ -168,3 +168,26 @@ class CartesianPathConstraintTests(unittest.TestCase):
                 model, points, start_angles, 100.0, 500.0, 10000.0,
                 pose_constraints={10: wrong_pose},
             )
+
+class CornerStopTimingTests(unittest.TestCase):
+    def test_joint_velocity_is_zero_at_declared_corner(self):
+        from trajectory_planner import plan_cartesian_path
+
+        model = PlanarArmDynamics([1.0, 1.0, 1.0], link_masses=[0.0] * 3, gravity=0.0)
+        start_angles = np.radians([90.0, -90.0, 90.0])
+        start = model.arm.forward_kinematics(start_angles)[-1]
+        points = np.linspace(start, start + np.array([0.08, -0.06]), 31)
+        corner_index = 15
+        result = plan_cartesian_path(
+            model, points, start_angles, 100.0, 500.0, 10000.0,
+            initial_duration=2.0, sample_count=41, max_duration=2.0,
+            corner_indices=[corner_index],
+        )
+        self.assertTrue(result.success, result.message)
+        corner_progress = result.path_progress[corner_index]
+        corner_time = result.duration * corner_progress
+        index = int(np.argmin(np.abs(result.times - corner_time)))
+        self.assertLess(abs(result.times[index] - corner_time), 1e-6)
+        np.testing.assert_allclose(result.joint_angles[index], result.path_joint_angles[corner_index], atol=1e-5)
+        np.testing.assert_allclose(result.joint_velocities[index], 0.0, atol=1e-8)
+        np.testing.assert_allclose(result.joint_accelerations[index], 0.0, atol=1e-7)

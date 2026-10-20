@@ -3,10 +3,11 @@
 import csv
 import math
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
-from scipy.interpolate import CubicSpline, PchipInterpolator
+from scipy.interpolate import CubicHermiteSpline, CubicSpline, PchipInterpolator
 from PySide6.QtCore import QSignalBlocker, Qt, QTimer
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
@@ -23,6 +24,8 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QInputDialog,
+    QMessageBox,
     QScrollArea,
     QVBoxLayout,
     QWidget,
@@ -33,6 +36,8 @@ from PySide6.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QHeaderView,
+    QLayout,
+    QSizePolicy,
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -48,8 +53,9 @@ from dynamics import PlanarArmDynamics
 from trajectory_dynamics import calculate_trajectory_torques
 from trajectory_planner import plan_cartesian_path
 from workspace import ArmWorkspace
-from path_trajectory import sample_path_by_arclength, parameterize_path
+from path_trajectory import sample_path_by_arclength, parameterize_path, find_sharp_corner_indices
 from simulation_plot import SimulationPlot, AxisSelectionDialog, VARIABLES, variable_key
+from experiment_io import write_experiment_package, read_experiment_package
 
 
 class MainWindow(QMainWindow):
@@ -75,7 +81,8 @@ class MainWindow(QMainWindow):
         self._updating_controls = False
         self.fixed_nodes = {}
         self._simulation_timer = QTimer(self)
-        self._simulation_timer.setInterval(30)
+        # 以 100 Hz 记录仿真数据，提升短时轨迹的绘图采样密度。
+        self._simulation_timer.setInterval(10)
         self._simulation_timer.timeout.connect(self._advance_simulation)
         self._simulation_times = np.array([], dtype=float)
         self._simulation_points = np.empty((0, 2), dtype=float)
@@ -84,6 +91,8 @@ class MainWindow(QMainWindow):
         self._simulation_log_times = []
         self._simulation_log_positions = []
         self._simulation_log_angles = []
+        self._simulation_log_velocities = []
+        self._simulation_log_accelerations = []
         self._simulation_log_torques = []
         self._planned_joint_angles = None
         self._planned_path_progress = None
@@ -134,6 +143,17 @@ class MainWindow(QMainWindow):
         self.robot_settings_action.triggered.connect(lambda: self._show_panel("robot"))
         toolbar.addAction(self.robot_settings_action)
 
+        toolbar.addSeparator()
+        self.save_experiment_action = QAction("保存实验包", self)
+        self.save_experiment_action.setShortcut("Ctrl+S")
+        self.save_experiment_action.triggered.connect(self._save_experiment_package)
+        toolbar.addAction(self.save_experiment_action)
+
+        self.load_experiment_action = QAction("加载实验包", self)
+        self.load_experiment_action.setShortcut("Ctrl+O")
+        self.load_experiment_action.triggered.connect(self._load_experiment_package)
+        toolbar.addAction(self.load_experiment_action)
+
         self.link_count_control = QSpinBox()
         self.link_count_control.setRange(1, 12)
         self.link_count_control.setValue(self.arm.joint_count)
@@ -157,6 +177,7 @@ class MainWindow(QMainWindow):
         try:
             # 每段路径至少分配 240 个几何采样点，减少相邻关键锚点映射到同一采样点的误报。
             sampled = sample_path_by_arclength(anchors, sample_count=max(240, 240 * (len(anchors) - 1)), preserve_anchors=True)
+            corner_indices = find_sharp_corner_indices(anchors, sampled)
             self._planned_joint_angles = None
             self._planned_path_progress = None
             self._planned_path_spline = None
@@ -190,15 +211,18 @@ class MainWindow(QMainWindow):
                 sample_count=240, max_duration=max_duration,
                 joint_limits=self.joint_limits if self._joint_limits_enabled() else None,
                 pose_constraints=pose_constraints,
+                corner_indices=corner_indices,
+                max_end_effector_speed=(self.max_end_effector_speed_control.value() if self.end_effector_speed_limit_enabled.isChecked() else float("inf")),
+                max_joint_jerk=(self.max_joint_jerk_control.value() if self.jerk_limit_enabled.isChecked() else float("inf")),
             )
             if not plan.success:
                 raise ValueError(plan.message)
             times = plan.times
             self._planned_joint_angles = plan.joint_angles
             self._planned_path_progress = plan.path_progress
-            # 将规划输出的离散关节轨迹构造成连续、保形的时间插值器。
-            # 播放时只采样该插值器，不再逐帧切换 IK 解或硬切关键姿态。
-            self._planned_path_spline = PchipInterpolator(times, plan.joint_angles, axis=0)
+            # 使用规划器给出的关节角和角速度构造 Hermite 插值，保留拐点处的零速度条件。
+            # 仅对时间轨迹插值，不修改用户定义的笛卡尔路径点。
+            self._planned_path_spline = CubicHermiteSpline(times, plan.joint_angles, plan.joint_velocities, axis=0)
             self._planned_cartesian_path = sampled.copy()
             self._planned_pose_constraints = {
                 int(index): np.asarray(angles, dtype=float).copy()
@@ -206,7 +230,7 @@ class MainWindow(QMainWindow):
             }
             # 仿真播放的目标位置直接来自笛卡尔路径，不再由关节空间样条反算末端位置。
             points = sampled.copy()
-            self._set_status(f"规划成功：总时间 {plan.duration:.2f} s，搜索 {plan.iterations} 次。", "valid")
+            self._set_status(f"规划成功：总时间 {plan.duration:.2f} s，识别到 {len(corner_indices)} 个尖角停速点，搜索 {plan.iterations} 次。", "valid")
         except ValueError as exc:
             self._planned_joint_angles = None
             self._planned_path_progress = None
@@ -216,7 +240,7 @@ class MainWindow(QMainWindow):
             self.constraint_result_label.setText(f"规划失败：{exc}")
             self._set_status(str(exc), "invalid")
             return
-        self.constraint_result_label.setText(f"路径规划成功：总时间 {float(times[-1]):.2f} s；播放时回放规划阶段生成的连续关节轨迹，避免逐帧逆运动学切换构型。")
+        self.constraint_result_label.setText(f"路径规划成功：总时间 {float(times[-1]):.2f} s；已识别 {len(corner_indices)} 个尖角并在各拐点停速，播放时沿用规划关节轨迹。")
         self._simulation_times = times
         self._simulation_points = points
         self._simulation_duration = float(times[-1])
@@ -394,10 +418,11 @@ class MainWindow(QMainWindow):
         return directed_anchors
 
     def _start_simulation(self):
+        # ?????????????????????????????????????
+        # ??????????????????????????????
+        self._prepare_simulation()
         if not getattr(self, "_simulation_prepared", False):
-            self._prepare_simulation()
-            if not getattr(self, "_simulation_prepared", False):
-                return
+            return
         self._simulation_timer.stop()
         if self.trajectory_edit_action.isChecked():
             self.trajectory_edit_action.setChecked(False)
@@ -455,6 +480,8 @@ class MainWindow(QMainWindow):
         self._simulation_log_times = []
         self._simulation_log_positions = []
         self._simulation_log_angles = []
+        self._simulation_log_velocities = []
+        self._simulation_log_accelerations = []
         self._simulation_log_torques = []
         self._refresh_simulation_plot()
 
@@ -464,6 +491,13 @@ class MainWindow(QMainWindow):
         self._simulation_log_times.append(float(time_value))
         self._simulation_log_positions.append(positions.copy())
         self._simulation_log_angles.append(self.joint_angles.copy())
+        if self._planned_path_spline is not None:
+            sample_time = float(time_value)
+            self._simulation_log_velocities.append(np.asarray(self._planned_path_spline(sample_time, 1), dtype=float))
+            self._simulation_log_accelerations.append(np.asarray(self._planned_path_spline(sample_time, 2), dtype=float))
+        else:
+            self._simulation_log_velocities.append(np.zeros(self.arm.joint_count, dtype=float))
+            self._simulation_log_accelerations.append(np.zeros(self.arm.joint_count, dtype=float))
         self._recalculate_simulation_torques(incremental=True)
         self._refresh_simulation_plot()
         self._refresh_data_table()
@@ -530,6 +564,8 @@ class MainWindow(QMainWindow):
             self._simulation_time,
             self._simulation_duration,
             self._simulation_log_torques,
+            self._simulation_log_velocities,
+            self._simulation_log_accelerations,
         )
         if self._plot_window is None:
             plot.set_configuration(self._plot_configs[0]["x"], self._plot_configs[0]["ys"], "shared")
@@ -537,16 +573,24 @@ class MainWindow(QMainWindow):
             plot.update()
         else:
             while len(self._plot_widgets) < len(self._plot_configs):
-                extra = SimulationPlot(self._plot_window)
+                extra = SimulationPlot(self._plot_charts_container)
+                extra.setMinimumHeight(320)
                 self._plot_widgets.append(extra)
-                self._plot_window_layout.addWidget(extra, 1)
+                self._plot_charts_layout.addWidget(extra, 0)
             for index, config in enumerate(self._plot_configs):
-                self._plot_widgets[index].set_data(self._simulation_log_times, self._simulation_log_positions, self._simulation_log_angles, self._simulation_time, self._simulation_duration, self._simulation_log_torques)
+                self._plot_widgets[index].set_data(self._simulation_log_times, self._simulation_log_positions, self._simulation_log_angles, self._simulation_time, self._simulation_duration, self._simulation_log_torques, self._simulation_log_velocities, self._simulation_log_accelerations)
                 self._plot_widgets[index].set_configuration(config["x"], config["ys"], "shared")
                 self._plot_widgets[index].chart_title = self._chart_title(config, index + 1)
                 self._plot_widgets[index].update()
             for index in range(len(self._plot_widgets) - 1, len(self._plot_configs) - 1, -1):
                 self._plot_widgets[index].hide()
+            # QScrollArea 在 widgetResizable=True 时可能把内容容器压回视口高度，
+            # 因此显式按当前可见图表数量设置内容高度，确保纵向滚动条真正生效。
+            chart_height = 320
+            chart_spacing = self._plot_charts_layout.spacing()
+            visible_count = len(self._plot_configs)
+            content_height = visible_count * chart_height + max(0, visible_count - 1) * chart_spacing
+            self._plot_charts_container.setMinimumHeight(content_height)
 
     def _chart_title(self, config, chart_index):
         labels = dict(self._plot_variables())
@@ -570,9 +614,26 @@ class MainWindow(QMainWindow):
             self._plot_window.setWindowTitle("仿真数据绘图")
             self._plot_window.resize(1100, 760)
             layout = QVBoxLayout(self._plot_window)
+            # 子控件的 sizeHint 不应反向撑大整个对话框；图表溢出交给滚动区域处理。
+            layout.setSizeConstraint(QLayout.SizeConstraint.SetNoConstraint)
             self._plot_window_layout = layout
+            self._plot_scroll_area = QScrollArea(self._plot_window)
+            self._plot_scroll_area.setMinimumSize(0, 0)
+            self._plot_scroll_area.setSizePolicy(
+                QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+            )
+            self._plot_scroll_area.setWidgetResizable(True)
+            self._plot_scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+            self._plot_scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+            self._plot_charts_container = QWidget()
+            self._plot_charts_layout = QVBoxLayout(self._plot_charts_container)
+            self._plot_charts_layout.setContentsMargins(0, 0, 0, 0)
+            self._plot_charts_layout.setSpacing(10)
             self._plot_widgets = [self.simulation_plot]
-            layout.addWidget(self.simulation_plot, 1)
+            self.simulation_plot.setMinimumHeight(320)
+            self._plot_charts_layout.addWidget(self.simulation_plot, 0)
+            self._plot_scroll_area.setWidget(self._plot_charts_container)
+            layout.addWidget(self._plot_scroll_area, 1)
             self._data_button = QPushButton("查看数据")
             self._data_button.clicked.connect(self._open_data_window)
             layout.addWidget(self._data_button)
@@ -581,6 +642,200 @@ class MainWindow(QMainWindow):
             layout.addWidget(export_image)
             self._refresh_simulation_plot()
         self._plot_window.show()
+
+    def _experiment_configuration(self):
+        anchors = []
+        for point, incoming, outgoing in self.workspace.path_anchors():
+            anchors.append({
+                "point": np.asarray(point, dtype=float).tolist(),
+                "incoming": None if incoming is None else np.asarray(incoming, dtype=float).tolist(),
+                "outgoing": None if outgoing is None else np.asarray(outgoing, dtype=float).tolist(),
+            })
+        return {
+            "model": {
+                "link_lengths_m": self.arm.link_lengths.tolist(),
+                "joint_angles_rad": self.joint_angles.tolist(),
+                "target_m": self.target.tolist(),
+                "fixed_nodes": {str(k): np.asarray(v, dtype=float).tolist() for k, v in self.fixed_nodes.items()},
+                "joint_limits_rad": {
+                    "lower": self.joint_limits.lower.tolist(), "upper": self.joint_limits.upper.tolist(),
+                    "lower_enabled": [c.isChecked() for c in self.lower_limit_enabled],
+                    "upper_enabled": [c.isChecked() for c in self.upper_limit_enabled],
+                },
+            },
+            "dynamics": {
+                "link_masses_kg": self._link_masses.tolist(),
+                "center_of_mass_fractions": self._com_fractions.tolist(),
+                "link_inertias_kg_m2": self._link_inertias.tolist(),
+                "payload_mass_kg": float(self._payload_mass),
+            },
+            "constraints": {
+                "max_duration": {"enabled": self.max_duration_limit_enabled.isChecked(), "value_s": self.max_duration_control.value()},
+                "joint_speed": {"enabled": self.speed_limit_enabled.isChecked(), "value_rad_s": self.max_joint_speed_control.value()},
+                "end_effector_speed": {"enabled": self.end_effector_speed_limit_enabled.isChecked(), "value_m_s": self.max_end_effector_speed_control.value()},
+                "joint_acceleration": {"enabled": self.acceleration_limit_enabled.isChecked(), "value_rad_s2": self.max_joint_acceleration_control.value()},
+                "joint_jerk": {"enabled": self.jerk_limit_enabled.isChecked(), "value_rad_s3": self.max_joint_jerk_control.value()},
+                "joint_torque": {"enabled": self.torque_limit_enabled.isChecked(), "value_nm": self.max_joint_torque_control.value()},
+            },
+            "trajectory": {
+                "anchors": anchors, "selected_route_indices": list(self.simulation_route_indices),
+            },
+            "plots": {
+                "configurations": self._plot_configs,
+                "display_mode": self._plot_display_mode,
+                "data_columns": list(getattr(self, "_data_columns", ["time"])),
+            },
+            "algorithm": {
+                "planner": "plan_cartesian_path",
+                "path_sampling": "sample_path_by_arclength",
+                "minimum_samples_per_anchor_segment": 240,
+                "time_scaling": "quintic",
+                "joint_path_interpolation": "PCHIP, segmented at detected sharp corners",
+                "sharp_corner_angle_tolerance_deg": 1.0,
+                "playback_sampling_target_hz": 100,
+                "max_planning_duration_s": self.max_duration_control.value() if self.max_duration_limit_enabled.isChecked() else 120.0,
+            },
+            "simulation": {"duration_s": float(self._simulation_duration), "recorded_samples": len(self._simulation_log_times)},
+        }
+
+    def _save_experiment_package(self):
+        parent_directory = QFileDialog.getExistingDirectory(
+            self, "选择实验包存放位置", str(PROJECT_ROOT / "数据与实验")
+        )
+        if not parent_directory:
+            return
+        default_name = "实验_" + datetime.now().strftime("%Y%m%d_%H%M%S")
+        name, accepted = QInputDialog.getText(
+            self, "新建实验文件夹", "实验文件夹名称：", text=default_name
+        )
+        if not accepted:
+            return
+        name = name.strip()
+        if not name or name in {".", ".."} or any(ch in name for ch in '<>:"/\\|?*'):
+            QMessageBox.warning(self, "文件夹名称无效", "请输入有效的文件夹名称。")
+            return
+        root = Path(parent_directory) / name
+        if root.exists() and any(root.iterdir()):
+            answer = QMessageBox.question(
+                self, "覆盖实验包", f"文件夹“{name}”已存在且不为空，是否覆盖其中的同名实验文件？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        root.mkdir(parents=True, exist_ok=True)
+        if self._simulation_timer.isActive():
+            self._simulation_timer.stop()
+            self.simulation_pause_button.setText("继续")
+        try:
+            summary = write_experiment_package(
+                root, self._experiment_configuration(), self._simulation_log_times,
+                self._simulation_log_positions, self._simulation_log_angles,
+                self._simulation_log_velocities, self._simulation_log_accelerations,
+                self._simulation_log_torques,
+            )
+        except (OSError, ValueError, TypeError) as exc:
+            self._set_status(f"实验包保存失败：{exc}", "invalid")
+            return
+        self._set_status(f"实验包已保存到 {root}；记录 {summary['sample_count']} 个采样点。", "valid")
+
+    def _load_experiment_package(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "加载实验包", str(PROJECT_ROOT / "数据与实验"), "实验配置 (experiment.json)"
+        )
+        if not path:
+            return
+        try:
+            package = read_experiment_package(path)
+            config = package["configuration"]
+            model = config["model"]
+            lengths = model["link_lengths_m"]
+            if not 1 <= len(lengths) <= 12:
+                raise ValueError("实验文件中的连杆数量必须在 1 到 12 段之间。")
+            self._simulation_timer.stop()
+            self.link_count_control.setValue(len(lengths))
+            self._set_link_count()
+            for control, value in zip(self.link_controls, lengths):
+                control.setValue(float(value))
+            self.arm = PlanarArm(lengths)
+            self.joint_angles = np.asarray(model["joint_angles_rad"], dtype=float)
+            if self.joint_angles.shape != (self.arm.joint_count,):
+                raise ValueError("实验文件中的关节角数量与连杆数量不一致。")
+            limits = model["joint_limits_rad"]
+            self.joint_limits = JointLimits(limits["lower"], limits["upper"])
+            for controls, values in ((self.lower_controls, np.degrees(self.joint_limits.lower)),
+                                     (self.upper_controls, np.degrees(self.joint_limits.upper))):
+                for control, value in zip(controls, values):
+                    control.setValue(float(value))
+            for controls, values in ((self.lower_limit_enabled, limits["lower_enabled"]),
+                                     (self.upper_limit_enabled, limits["upper_enabled"])):
+                for control, value in zip(controls, values):
+                    control.setChecked(bool(value))
+            dynamics = config["dynamics"]
+            self._link_masses = np.asarray(dynamics["link_masses_kg"], dtype=float)
+            self._com_fractions = np.asarray(dynamics["center_of_mass_fractions"], dtype=float)
+            self._link_inertias = np.asarray(dynamics["link_inertias_kg_m2"], dtype=float)
+            self._payload_mass = float(dynamics["payload_mass_kg"])
+            for name, values in (("_link_mass_controls", self._link_masses),
+                                 ("_com_fraction_controls", self._com_fractions),
+                                 ("_link_inertia_controls", self._link_inertias)):
+                for control, value in zip(getattr(self, name), values):
+                    control.setValue(float(value))
+            self._payload_mass_control.setValue(self._payload_mass)
+            constraints = config["constraints"]
+            control_map = (
+                ("max_duration", self.max_duration_limit_enabled, self.max_duration_control, "value_s"),
+                ("joint_speed", self.speed_limit_enabled, self.max_joint_speed_control, "value_rad_s"),
+                ("end_effector_speed", self.end_effector_speed_limit_enabled, self.max_end_effector_speed_control, "value_m_s"),
+                ("joint_acceleration", self.acceleration_limit_enabled, self.max_joint_acceleration_control, "value_rad_s2"),
+                ("joint_jerk", self.jerk_limit_enabled, self.max_joint_jerk_control, "value_rad_s3"),
+                ("joint_torque", self.torque_limit_enabled, self.max_joint_torque_control, "value_nm"),
+            )
+            for key, checkbox, spinbox, value_key in control_map:
+                checkbox.setChecked(bool(constraints[key]["enabled"]))
+                spinbox.setValue(float(constraints[key][value_key]))
+            trajectory = config["trajectory"]
+            self.workspace._path_anchors = [
+                (np.asarray(a["point"], dtype=float),
+                 None if a["incoming"] is None else np.asarray(a["incoming"], dtype=float),
+                 None if a["outgoing"] is None else np.asarray(a["outgoing"], dtype=float))
+                for a in trajectory["anchors"]
+            ]
+            self.workspace.update()
+            self.simulation_route_indices = [int(i) for i in trajectory["selected_route_indices"]]
+            if any(i < 0 or i >= len(self.workspace._path_anchors) for i in self.simulation_route_indices):
+                raise ValueError("实验文件中的路径序号超出锚点范围。")
+            self.simulation_path_points_label.setText(
+                "路径顺序：" + " → ".join(str(i + 1) for i in self.simulation_route_indices)
+                if self.simulation_route_indices else "尚未选择路径点"
+            )
+            self._refresh_pose_anchor_options()
+            plots = config.get("plots", {})
+            self._plot_configs = plots.get("configurations", [{"x": "time", "ys": ["node_x:1"]}])
+            self._plot_display_mode = plots.get("display_mode", "shared")
+            self._data_columns = plots.get("data_columns", ["time"])
+            self._refresh_plot_configuration_labels()
+            self._simulation_duration = float(config.get("simulation", {}).get("duration_s", 5.0))
+            self.target = np.asarray(model["target_m"], dtype=float)
+            self.fixed_nodes = {int(k): np.asarray(v, dtype=float) for k, v in model.get("fixed_nodes", {}).items()}
+            self.target_status = "valid"
+            self._simulation_time = 0.0
+            self._simulation_prepared = False
+            self._planned_path_spline = self._planned_joint_angles = self._planned_cartesian_path = None
+            self._simulation_log_times = package["times"]
+            self._simulation_log_positions = package["positions"]
+            self._simulation_log_angles = package["angles"]
+            self._simulation_log_velocities = package["velocities"]
+            self._simulation_log_accelerations = package["accelerations"]
+            self._simulation_log_torques = package["torques"]
+            self._sync_controls()
+            self.workspace.set_state(self.arm.link_lengths, self.joint_angles, self.target, self.target_status, self.fixed_nodes)
+            self._refresh_workspace()
+            self._refresh_simulation_plot()
+            self._refresh_data_table()
+            self._set_status(f"已加载实验包：{Path(path).parent}。重新运行前请点击“准备”。", "valid")
+        except (OSError, ValueError, KeyError, TypeError, IndexError) as exc:
+            self._set_status(f"实验包加载失败：{exc}", "invalid")
 
     def _export_plot_image(self):
         if self._plot_window is None or not self._plot_widgets:
@@ -1000,7 +1255,7 @@ class MainWindow(QMainWindow):
         else:
             lines.insert(1, "结论：所检查的三项指标均未超过设定限值。")
             self._set_status("轨迹可执行性检查：当前设定下未发现超限。", "valid")
-        lines.append("注意：角速度和角加速度由离散轨迹数值微分估算；该检查不包含碰撞、摩擦、电机动态或控制误差。可在结果区域内滚动查看完整说明。")
+        lines.append("注意：本检查的角速度和角加速度由离散轨迹数值微分估算；绘图中的关节角速度/角加速度优先采用规划样条的解析导数。检查不包含碰撞、摩擦、电机动态或控制误差。可在结果区域内滚动查看完整说明。")
         self.feasibility_result_label.setText("\n".join(lines))
 
     def _advance_simulation(self):
@@ -1152,8 +1407,11 @@ class MainWindow(QMainWindow):
             limit_form.addRow(f"关节 {index + 1} 上限", upper_row)
         layout.addWidget(limit_group)
 
-        status_group = QGroupBox("求解状态")
+        status_group = QGroupBox("求解状态与奇异性")
         status_layout = QVBoxLayout(status_group)
+        self.singularity_label = QLabel("雅可比分析：等待计算")
+        self.singularity_label.setWordWrap(True)
+        status_layout.addWidget(self.singularity_label)
         self.status_label = QLabel("等待操作")
         self.status_label.setWordWrap(True)
         self.status_label.setMinimumHeight(64)
@@ -1164,8 +1422,14 @@ class MainWindow(QMainWindow):
         self._panel_pages["properties"] = panel
         self._panel_stack.addWidget(panel)
 
-        simulation_panel = QWidget(dock)
+        simulation_scroll = QScrollArea(dock)
+        simulation_scroll.setWidgetResizable(True)
+        simulation_scroll.setMinimumSize(0, 0)
+        simulation_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        simulation_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        simulation_panel = QWidget()
         simulation_layout = QVBoxLayout(simulation_panel)
+        simulation_scroll.setWidget(simulation_panel)
         simulation_layout.addWidget(QLabel("按顺序选择已编辑轨迹上的紫色锚点。可重复选择同一锚点。"))
         self.simulation_route_indices = []
         self.simulation_path_points_label = QLabel("尚未选择路径点")
@@ -1199,6 +1463,14 @@ class MainWindow(QMainWindow):
         speed_limit_row.addWidget(self.speed_limit_enabled)
         speed_limit_row.addWidget(self.max_joint_speed_control, 1)
         feasibility_form.addRow("角速度上限（rad/s）", speed_limit_row)
+        self.max_end_effector_speed_control = self._make_spinbox(0.001, 100.0, 3, 0.05)
+        self.max_end_effector_speed_control.setValue(0.5)
+        self.max_end_effector_speed_control.setToolTip("末端执行器允许的最大线速度，单位 m/s")
+        self.end_effector_speed_limit_enabled = QCheckBox("启用")
+        end_speed_row = QHBoxLayout()
+        end_speed_row.addWidget(self.end_effector_speed_limit_enabled)
+        end_speed_row.addWidget(self.max_end_effector_speed_control, 1)
+        feasibility_form.addRow("末端线速度上限（m/s）", end_speed_row)
         self.max_joint_acceleration_control = self._make_spinbox(0.01, 500.0, 2, 0.5)
         self.max_joint_acceleration_control.setValue(10.0)
         self.max_joint_acceleration_control.setToolTip("各关节允许的最大绝对角加速度，单位 rad/s²")
@@ -1208,6 +1480,14 @@ class MainWindow(QMainWindow):
         acceleration_limit_row.addWidget(self.acceleration_limit_enabled)
         acceleration_limit_row.addWidget(self.max_joint_acceleration_control, 1)
         feasibility_form.addRow("角加速度上限（rad/s²）", acceleration_limit_row)
+        self.max_joint_jerk_control = self._make_spinbox(0.01, 10000.0, 2, 1.0)
+        self.max_joint_jerk_control.setValue(50.0)
+        self.max_joint_jerk_control.setToolTip("各关节允许的最大角加加速度，单位 rad/s³；用于限制角加速度变化过快")
+        self.jerk_limit_enabled = QCheckBox("启用")
+        jerk_limit_row = QHBoxLayout()
+        jerk_limit_row.addWidget(self.jerk_limit_enabled)
+        jerk_limit_row.addWidget(self.max_joint_jerk_control, 1)
+        feasibility_form.addRow("角加加速度上限（rad/s³）", jerk_limit_row)
         self.max_joint_torque_control = self._make_spinbox(0.01, 10000.0, 2, 0.5)
         self.max_joint_torque_control.setValue(20.0)
         self.max_joint_torque_control.setToolTip("各关节允许的最大绝对理论驱动力矩，单位 N·m")
@@ -1260,8 +1540,8 @@ class MainWindow(QMainWindow):
         simulation_layout.addWidget(self.open_plot_window_button)
         self._refresh_plot_configuration_labels()
         simulation_layout.addStretch(1)
-        self._panel_pages["simulation"] = simulation_panel
-        self._panel_stack.addWidget(simulation_panel)
+        self._panel_pages["simulation"] = simulation_scroll
+        self._panel_stack.addWidget(simulation_scroll)
 
         robot_panel = QWidget(dock)
         robot_layout = QVBoxLayout(robot_panel)
@@ -1492,6 +1772,10 @@ class MainWindow(QMainWindow):
             for control in (*self.lower_limit_enabled, *self.upper_limit_enabled)
         )
 
+    def _effective_joint_limits(self):
+        """????????????????????????"""
+        return self.joint_limits if self._joint_limits_enabled() else None
+
     def _on_limits_changed(self, _value):
         if self._updating_controls:
             return
@@ -1528,7 +1812,7 @@ class MainWindow(QMainWindow):
             self._refresh_workspace()
             return
         angles, error, converged = solve_n_link_ik(
-            self.arm, self.target, self.joint_angles, self.joint_limits
+            self.arm, self.target, self.joint_angles, self._effective_joint_limits()
         )
         if not converged:
             self.target_status = "invalid"
@@ -1596,7 +1880,7 @@ class MainWindow(QMainWindow):
                     drag_constraints.setdefault(index, current_positions[index].copy())
             angles, error, converged = solve_constrained_drag(
                 self.arm, joint_index, [x, y], self.joint_angles,
-                drag_constraints, self.joint_limits,
+                drag_constraints, self._effective_joint_limits(),
                 target_position=[x, y],
             )
             if not converged:
@@ -1634,7 +1918,7 @@ class MainWindow(QMainWindow):
         candidate_angles = self.joint_angles.copy()
         angle_index = joint_index - 1
         candidate_angles[angle_index] += delta
-        if not self.joint_limits.contains(candidate_angles):
+        if self._joint_limits_enabled() and not self.joint_limits.contains(candidate_angles):
             self.target_status = "invalid"
             self._set_status(
                 f"拖动将使关节 {angle_index + 1} 超出角度限位，已保持上一有效姿态。",
@@ -1685,7 +1969,7 @@ class MainWindow(QMainWindow):
                 ],
                 dtype=float,
             )
-            if not self.joint_limits.contains(angles):
+            if self._joint_limits_enabled() and not self.joint_limits.contains(angles):
                 continue
             delta = angles - self.joint_angles
             angle_change = float(np.dot(delta, delta))
@@ -1819,6 +2103,38 @@ class MainWindow(QMainWindow):
             self.target,
             self.target_status,
             self.fixed_nodes,
+        )
+        self._refresh_singularity_status()
+
+    def _refresh_singularity_status(self):
+        """更新当前姿态的几何奇异性与关节角限位状态。"""
+        metrics = self.arm.singularity_metrics(self.joint_angles)
+        singular_text = (
+            "几何状态：奇异位形"
+            if metrics["is_singular"]
+            else "几何状态：非奇异"
+        )
+        min_sv = metrics["min_singular_value"]
+        condition = metrics["condition_number"]
+        condition_text = "∞" if not math.isfinite(condition) else f"{condition:.4g}"
+        limit_violations = []
+        for index, angle in enumerate(self.joint_angles):
+            lower_enabled = index < len(self.lower_limit_enabled) and self.lower_limit_enabled[index].isChecked()
+            upper_enabled = index < len(self.upper_limit_enabled) and self.upper_limit_enabled[index].isChecked()
+            lower = math.radians(self.lower_controls[index].value()) if index < len(self.lower_controls) else -math.inf
+            upper = math.radians(self.upper_controls[index].value()) if index < len(self.upper_controls) else math.inf
+            tolerance = 1e-9
+            if lower_enabled and angle < lower - tolerance:
+                limit_violations.append(f"关节 {index + 1} 低于下限")
+            if upper_enabled and angle > upper + tolerance:
+                limit_violations.append(f"关节 {index + 1} 高于上限")
+        limit_text = "关节角限位：违规（" + "、".join(limit_violations) + "）" if limit_violations else "关节角限位：未发现违规"
+        self.singularity_label.setText(
+            f"{singular_text}\n雅可比秩：{metrics['rank']}/{metrics['max_rank']}\n"
+            f"最小奇异值：{min_sv:.4g}\n条件数：{condition_text}\n{limit_text}"
+        )
+        self.singularity_label.setStyleSheet(
+            "color: #a56a12;" if metrics["is_singular"] else "color: #237a57;"
         )
 
     def _reset_pose(self):

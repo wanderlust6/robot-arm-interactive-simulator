@@ -1,0 +1,139 @@
+{
+  "schema_version": 1,
+  "created_at": "2026-10-20T11:34:43.994086+00:00",
+  "application": "机械臂交互式仿真平台",
+  "configuration": {
+    "model": {
+      "link_lengths_m": [
+        0.6,
+        0.4
+      ],
+      "joint_angles_rad": [
+        0.6108652381980153,
+        0.6108652381980153
+      ],
+      "target_m": [
+        1.0,
+        0.0
+      ],
+      "fixed_nodes": {},
+      "joint_limits_rad": {
+        "lower": [
+          -3.141592653589793,
+          -3.141592653589793
+        ],
+        "upper": [
+          3.141592653589793,
+          3.141592653589793
+        ],
+        "lower_enabled": [
+          false,
+          false
+        ],
+        "upper_enabled": [
+          false,
+          false
+        ]
+      }
+    },
+    "dynamics": {
+      "link_masses_kg": [
+        1.0,
+        0.7
+      ],
+      "center_of_mass_fractions": [
+        0.5,
+        0.5
+      ],
+      "link_inertias_kg_m2": [
+        0.03,
+        0.009333333333333334
+      ],
+      "payload_mass_kg": 0.1
+    },
+    "constraints": {
+      "max_duration": {
+        "enabled": true,
+        "value_s": 30.0
+      },
+      "joint_speed": {
+        "enabled": true,
+        "value_rad_s": 2.5
+      },
+      "end_effector_speed": {
+        "enabled": true,
+        "value_m_s": 0.5
+      },
+      "joint_acceleration": {
+        "enabled": true,
+        "value_rad_s2": 5.0
+      },
+      "joint_jerk": {
+        "enabled": false,
+        "value_rad_s3": 100.0
+      },
+      "joint_torque": {
+        "enabled": true,
+        "value_nm": 100.0
+      }
+    },
+    "trajectory": {
+      "anchors": [
+        {
+          "point": [
+            0.6282992839036626,
+            0.720022910124991
+          ],
+          "incoming": null,
+          "outgoing": null
+        },
+        {
+          "point": [
+            1.0,
+            0.0
+          ],
+          "incoming": null,
+          "outgoing": null
+        }
+      ],
+      "selected_route_indices": [
+        0,
+        1
+      ]
+    },
+    "plots": {
+      "configurations": [
+        {
+          "x": "time",
+          "ys": [
+            "joint_angle:1",
+            "joint_angle:2"
+          ]
+        }
+      ],
+      "display_mode": "shared",
+      "data_columns": [
+        "time"
+      ]
+    },
+    "algorithm": {
+      "planner": "plan_cartesian_path",
+      "path_sampling": "straight_line_241_samples",
+      "time_scaling": "quintic",
+      "joint_path_interpolation": "PCHIP",
+      "baseline_experiment": true
+    },
+    "simulation": {
+      "duration_s": 4.6875,
+      "recorded_samples": 480
+    },
+    "experiment": {
+      "title": "03_完全伸直",
+      "purpose": "奇异边界场景：两连杆目标位于完全伸直构型。用于观察边界数值行为，不预设结果。",
+      "final_relative_joint_2_deg": 0.0,
+      "planner_success": true,
+      "planner_message": "已找到满足所设速度、加速度、力矩、末端线速度和角加加速度上限的笛卡尔路径轨迹。",
+      "note": "results.csv 是预先计算的仿真记录，不是实体机械臂测量数据。导入后点击准备重新规划。"
+    }
+  }
+}

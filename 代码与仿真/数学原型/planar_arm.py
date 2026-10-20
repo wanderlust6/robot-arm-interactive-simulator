@@ -68,3 +68,30 @@ class PlanarArm:
         joint_to_end = end_position - positions[:-1]
 
         return np.vstack((-joint_to_end[:, 1], joint_to_end[:, 0]))
+
+    def singularity_metrics(self, joint_angles: Sequence[float]) -> dict[str, object]:
+        """返回末端位置雅可比矩阵的秩、奇异值和条件数。
+
+        rank 采用 NumPy 的数值秩判定。对单关节机械臂，满秩上限为 1，
+        因此不会仅因无法覆盖二维平面的全部方向就被误判为奇异位形。
+        """
+        jacobian = self.jacobian(joint_angles)
+        singular_values = np.linalg.svd(jacobian, compute_uv=False)
+        rank = int(np.linalg.matrix_rank(jacobian))
+        max_rank = min(jacobian.shape)
+        min_singular_value = float(singular_values[-1]) if singular_values.size else 0.0
+        max_singular_value = float(singular_values[0]) if singular_values.size else 0.0
+
+        if rank < max_rank or min_singular_value == 0.0:
+            condition_number = float("inf")
+        else:
+            condition_number = max_singular_value / min_singular_value
+
+        return {
+            "rank": rank,
+            "max_rank": max_rank,
+            "singular_values": singular_values.copy(),
+            "min_singular_value": min_singular_value,
+            "condition_number": float(condition_number),
+            "is_singular": rank < max_rank,
+        }

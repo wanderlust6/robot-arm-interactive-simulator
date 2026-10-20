@@ -1,7 +1,7 @@
 """Configurable simulation plots and axis-selection dialogs."""
 
 import numpy as np
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QPoint, Qt
 from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import (
     QComboBox, QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout,
@@ -122,8 +122,11 @@ class SimulationPlot(QWidget):
         self.y_variables = ["node_x:3", "node_y:3", "joint_angle:1"]
         self.display_mode = "separate"
         self.chart_title = ""
+        self.setMouseTracking(True)
+        self._drawn_points = []
+        self._selected_point = None
 
-    def set_data(self, times, positions, angles, current_time, duration, torques=None):
+    def set_data(self, times, positions, angles, current_time, duration, torques=None, joint_velocities=None, joint_accelerations=None):
         self._times = np.asarray(times, dtype=float).copy()
         pos = np.asarray(positions, dtype=float)
         if pos.size == 0:
@@ -136,6 +139,10 @@ class SimulationPlot(QWidget):
         self._angles = angle_values.copy() if angle_values.size else np.empty((0, 0), dtype=float)
         torque_values = np.asarray(torques, dtype=float) if torques is not None else np.empty((0, 0), dtype=float)
         self._torques = torque_values.copy() if torque_values.size else np.empty((0, 0), dtype=float)
+        velocity_values = np.asarray(joint_velocities, dtype=float) if joint_velocities is not None else np.empty((0, 0), dtype=float)
+        acceleration_values = np.asarray(joint_accelerations, dtype=float) if joint_accelerations is not None else np.empty((0, 0), dtype=float)
+        self._joint_velocities = velocity_values.copy() if velocity_values.size else np.empty((0, 0), dtype=float)
+        self._joint_accelerations = acceleration_values.copy() if acceleration_values.size else np.empty((0, 0), dtype=float)
         self._current_time = max(0.0, float(current_time))
         self._duration = max(float(duration), 1e-9)
         self.update()
@@ -179,17 +186,38 @@ class SimulationPlot(QWidget):
                 return np.degrees(self._angles[:, index]) if index < self._angles.shape[1] else np.zeros(count)
             if kind == "link_angle":
                 return np.degrees(np.cumsum(self._angles, axis=1)[:, index]) if index < self._angles.shape[1] else np.zeros(count)
-            unwrapped = np.unwrap(self._angles, axis=0)
-            velocity = np.gradient(unwrapped, self._times, axis=0, edge_order=1) if count > 1 else np.zeros_like(unwrapped)
-            acceleration = np.gradient(velocity, self._times, axis=0, edge_order=1) if count > 2 else np.zeros_like(velocity)
             if index >= self._angles.shape[1]:
                 return np.zeros(count)
-            if kind == "joint_velocity": return velocity[:, index]
-            if kind == "joint_accel": return acceleration[:, index]
+            if kind == "joint_velocity":
+                if self._joint_velocities.shape == self._angles.shape:
+                    return self._joint_velocities[:, index]
+                unwrapped = np.unwrap(self._angles, axis=0)
+                return np.gradient(unwrapped, self._times, axis=0, edge_order=1) if count > 1 else np.zeros(count)
+            if kind == "joint_accel":
+                if self._joint_accelerations.shape == self._angles.shape:
+                    return self._joint_accelerations[:, index]
+                unwrapped = np.unwrap(self._angles, axis=0)
+                velocity = np.gradient(unwrapped, self._times, axis=0, edge_order=1) if count > 1 else np.zeros_like(unwrapped)
+                return np.gradient(velocity, self._times, axis=0, edge_order=1) if count > 2 else np.zeros(count)
         return np.zeros(count)
 
     def _x_values(self):
         return self._values(self.x_variable)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self._drawn_points:
+            mx, my = event.position().x(), event.position().y()
+            nearest = min(
+                self._drawn_points,
+                key=lambda point: (point[0] - mx) ** 2 + (point[1] - my) ** 2,
+            )
+            distance_squared = (nearest[0] - mx) ** 2 + (nearest[1] - my) ** 2
+            if distance_squared <= 324:
+                self._selected_point = nearest
+                self.update()
+                event.accept()
+                return
+        super().mousePressEvent(event)
 
     def paintEvent(self, _event):
         painter = QPainter(self)
@@ -203,6 +231,7 @@ class SimulationPlot(QWidget):
             painter.end()
             return
         x = self._x_values()
+        self._drawn_points = []
         series = [(key, self._values(key)) for key in self.y_variables]
         valid = [(key, values) for key, values in series if len(values) == len(x)]
         if not valid:
@@ -253,7 +282,9 @@ class SimulationPlot(QWidget):
                         continue
                     px = left + (xv - xmin) / (xmax - xmin) * (self.width() - left - right)
                     py = area_bottom - (yv - ymin) / (ymax - ymin) * panel_h
-                    points.append((int(px), int(py)))
+                    pixel_point = (int(px), int(py))
+                    points.append(pixel_point)
+                    self._drawn_points.append((pixel_point[0], pixel_point[1], float(xv), float(yv), key))
                 painter.setPen(QPen(color, 1.8))
                 previous = None
                 for point in points:
@@ -269,4 +300,17 @@ class SimulationPlot(QWidget):
             painter.setPen(QColor("#475569"))
             x_label = VARIABLES.get(parse_variable(self.x_variable)[0], (self.x_variable, "", ""))[0]
             painter.drawText(left, min(self.height() - 4, area_bottom + 29), x_label)
+        if self._selected_point is not None:
+            sx, sy, selected_x, selected_y, selected_key = self._selected_point
+            painter.setPen(QPen(QColor("#dc2626"), 2))
+            painter.drawEllipse(sx - 5, sy - 5, 10, 10)
+            x_name = VARIABLES.get(parse_variable(self.x_variable)[0], (self.x_variable, "", ""))[0]
+            y_name = VARIABLES.get(parse_variable(selected_key)[0], (selected_key, "", ""))[0]
+            coordinate_text = f"{x_name}: {selected_x:.6g}    {y_name}: {selected_y:.6g}"
+            text_rect = painter.fontMetrics().boundingRect(coordinate_text).adjusted(-8, -5, 8, 5)
+            text_rect.moveTopRight(self.rect().topRight() + QPoint(-8, 28))
+            painter.fillRect(text_rect, QColor("#fff7ed"))
+            painter.setPen(QPen(QColor("#b91c1c"), 1))
+            painter.drawRect(text_rect)
+            painter.drawText(text_rect.adjusted(8, 5, -8, -5), Qt.AlignmentFlag.AlignVCenter, coordinate_text)
         painter.end()

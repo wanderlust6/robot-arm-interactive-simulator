@@ -224,6 +224,9 @@ def plan_cartesian_path(
     max_iterations=60,
     joint_limits=None,
     pose_constraints=None,
+    corner_indices=None,
+    max_end_effector_speed=np.inf,
+    max_joint_jerk=np.inf,
 ):
     """沿给定笛卡尔路径连续求逆运动学，并自动搜索满足约束的运动时间。
 
@@ -285,43 +288,93 @@ def plan_cartesian_path(
     v_limit = _validate_limits(max_velocity, arm.joint_count, "角速度上限")
     a_limit = _validate_limits(max_acceleration, arm.joint_count, "角加速度上限")
     t_limit = _validate_limits(max_torque, arm.joint_count, "力矩上限")
+    end_speed_limit = float(max_end_effector_speed)
+    jerk_limit = float(max_joint_jerk)
+    if np.isnan(end_speed_limit) or end_speed_limit <= 0:
+        raise ValueError("末端线速度上限必须为正数")
+    if np.isnan(jerk_limit) or jerk_limit <= 0:
+        raise ValueError("关节角加加速度上限必须为正数")
     duration = float(initial_duration)
     max_duration = float(max_duration)
     if not np.isfinite(duration) or duration <= 0 or not np.isfinite(max_duration) or max_duration < duration:
         raise ValueError("初始运动时间和最大搜索时间必须有效，且最大时间不小于初始时间")
-    # 使用保形分段三次插值，避免普通三次样条在路径节点附近过冲，
-    # 进而导致末端越过目标后又折返。时间参数仍采用五次标定。
-    path_spline = PchipInterpolator(progress, joint_path, axis=0)
+    # 每个拐点都切分关节路径插值器，禁止插值器跨越拐点把两侧路径混在一起。
+    # 分段五次时间标定负责停速；几何采样点和拐点坐标本身均不移动。
+    raw_corners = () if corner_indices is None else tuple(corner_indices)
+    if any(isinstance(i, bool) or int(i) != i or not 0 < int(i) < len(points) - 1 for i in raw_corners):
+        raise ValueError("corner_indices 必须是内部路径采样点的索引")
+    corner_indices = tuple(sorted(set(int(i) for i in raw_corners)))
+    segment_progress = np.asarray([0.0] + [progress[i] for i in corner_indices] + [1.0], dtype=float)
+    if np.any(np.diff(segment_progress) <= 1e-12):
+        raise ValueError("拐点路径进度必须严格递增")
+    path_splines = []
+    for p0, p1 in zip(segment_progress[:-1], segment_progress[1:]):
+        mask = (progress >= p0 - 1e-12) & (progress <= p1 + 1e-12)
+        if np.count_nonzero(mask) < 2:
+            raise ValueError("拐点之间的路径采样点不足，无法保持分段轨迹")
+        path_splines.append(PchipInterpolator(progress[mask], joint_path[mask], axis=0))
     last = None
-    # 每个几何路径样本都必须对应一个时间样本；否则时间离散化可能跨过节点 2/3。
-    # 通过单调五次时间标定的数值逆映射，求出每个路径进度对应的准确时刻。
     inverse_grid = np.linspace(0.0, 1.0, 20001)
     inverse_blend = 10.0 * inverse_grid**3 - 15.0 * inverse_grid**4 + 6.0 * inverse_grid**5
-    path_sample_times = np.interp(progress, inverse_blend, inverse_grid)
+
     for iteration in range(1, int(max_iterations) + 1):
+        segment_durations = duration * np.diff(segment_progress)
+        segment_start_times = np.concatenate(([0.0], np.cumsum(segment_durations)))
         regular_times = np.linspace(0.0, duration, int(sample_count))
-        times = np.unique(np.concatenate((regular_times, path_sample_times * duration)))
-        s = times / duration
-        blend = 10.0 * s**3 - 15.0 * s**4 + 6.0 * s**5
-        blend_d = (30.0 * s**2 - 60.0 * s**3 + 30.0 * s**4) / duration
-        blend_dd = (60.0 * s - 180.0 * s**2 + 120.0 * s**3) / duration**2
-        angles = path_spline(blend)
-        path_velocity = path_spline(blend, 1)
-        path_acceleration = path_spline(blend, 2)
-        velocities = path_velocity * blend_d[:, None]
-        accelerations = path_acceleration * (blend_d[:, None] ** 2) + path_velocity * blend_dd[:, None]
+        exact_path_times = []
+        for segment_index, (p0, p1) in enumerate(zip(segment_progress[:-1], segment_progress[1:])):
+            mask = (progress >= p0 - 1e-12) & (progress <= p1 + 1e-12)
+            local_progress = np.clip((progress[mask] - p0) / (p1 - p0), 0.0, 1.0)
+            local_tau = np.interp(local_progress, inverse_blend, inverse_grid)
+            exact_path_times.extend(segment_start_times[segment_index] + local_tau * segment_durations[segment_index])
+        times = np.unique(np.concatenate((regular_times, np.asarray(exact_path_times))))
+        segment_ids = np.searchsorted(segment_start_times[1:], times, side="right")
+        segment_ids = np.minimum(segment_ids, len(segment_durations) - 1)
+        tau = (times - segment_start_times[segment_ids]) / segment_durations[segment_ids]
+        tau = np.clip(tau, 0.0, 1.0)
+        blend = 10.0 * tau**3 - 15.0 * tau**4 + 6.0 * tau**5
+        blend_d = (30.0 * tau**2 - 60.0 * tau**3 + 30.0 * tau**4) / segment_durations[segment_ids]
+        blend_dd = (60.0 * tau - 180.0 * tau**2 + 120.0 * tau**3) / segment_durations[segment_ids]**2
+        progress_at_time = segment_progress[segment_ids] + np.diff(segment_progress)[segment_ids] * blend
+        progress_velocity = np.diff(segment_progress)[segment_ids] * blend_d
+        progress_acceleration = np.diff(segment_progress)[segment_ids] * blend_dd
+        angles = np.empty((len(times), arm.joint_count), dtype=float)
+        path_velocity = np.empty_like(angles)
+        path_acceleration = np.empty_like(angles)
+        for segment_index, spline in enumerate(path_splines):
+            mask = segment_ids == segment_index
+            if np.any(mask):
+                segment_values = progress_at_time[mask]
+                angles[mask] = spline(segment_values)
+                path_velocity[mask] = spline(segment_values, 1)
+                path_acceleration[mask] = spline(segment_values, 2)
+        velocities = path_velocity * progress_velocity[:, None]
+        accelerations = path_acceleration * (progress_velocity[:, None] ** 2) + path_velocity * progress_acceleration[:, None]
         torques = np.asarray([model.inverse_dynamics(q, qd, qdd) for q, qd, qdd in zip(angles, velocities, accelerations)])
-        last = (times, angles, velocities, accelerations, torques)
+        jerks = np.gradient(accelerations, times, axis=0, edge_order=2) if len(times) > 2 else np.zeros_like(accelerations)
+        end_effector_speeds = np.asarray([
+            np.linalg.norm(arm.jacobian(q) @ qd) for q, qd in zip(angles, velocities)
+        ])
+        last = (times, angles, velocities, accelerations, torques, jerks, end_effector_speeds)
         passed = (np.all(np.abs(velocities) <= v_limit[None, :] * (1 + 1e-9))
                   and np.all(np.abs(accelerations) <= a_limit[None, :] * (1 + 1e-9))
-                  and np.all(np.abs(torques) <= t_limit[None, :] * (1 + 1e-9)))
+                  and np.all(np.abs(torques) <= t_limit[None, :] * (1 + 1e-9))
+                  and np.max(end_effector_speeds) <= end_speed_limit * (1 + 1e-9)
+                  and np.max(np.abs(jerks)) <= jerk_limit * (1 + 1e-9))
         if passed:
-            return TrajectoryPlanResult(True, "已找到满足所设速度、加速度和力矩上限的笛卡尔路径轨迹。", *last, duration, iteration, progress.copy(), joint_path.copy())
+            return TrajectoryPlanResult(True, "已找到满足所设速度、加速度、力矩、末端线速度和角加加速度上限的笛卡尔路径轨迹。", *last[:5], duration, iteration, progress.copy(), joint_path.copy())
         if duration >= max_duration:
             break
         duration = min(duration * 1.25, max_duration)
-    times, angles, velocities, accelerations, torques = last
+    times, angles, velocities, accelerations, torques, jerks, end_effector_speeds = last
     diagnostics = []
+    if np.max(end_effector_speeds) > end_speed_limit * (1 + 1e-9):
+        diagnostics.append(f"末端线速度超限（实际峰值/上限）：{np.max(end_effector_speeds):.3g}/{end_speed_limit:.3g} m/s")
+    if np.max(np.abs(jerks)) > jerk_limit * (1 + 1e-9):
+        jerk_peaks = np.max(np.abs(jerks), axis=0)
+        exceeded_jerks = np.flatnonzero(jerk_peaks > jerk_limit * (1 + 1e-9))
+        details = "、".join(f"关节 {index + 1} {jerk_peaks[index]:.3g}/{jerk_limit:.3g} rad/s³" for index in exceeded_jerks)
+        diagnostics.append(f"角加加速度超限：{details}")
     for name, values, limits, unit in (
         ("角速度", np.abs(velocities), v_limit, "rad/s"),
         ("角加速度", np.abs(accelerations), a_limit, "rad/s²"),
