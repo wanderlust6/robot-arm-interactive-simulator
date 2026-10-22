@@ -42,6 +42,13 @@
 - 两根连杆等长且目标恰在基座时存在无穷多组折叠解；该情况会通过结果消息明确说明。
 - `tolerance` 用于吸收工作空间边界附近的浮点误差，不代表关节角限位或控制精度。
 
+### continuous_ik.py
+
+- select_continuous_ik_solution(candidates, previous)：从两连杆解析逆运动学候选解中，选择按每个关节的 2π 周期展开后与上一姿态欧氏距离最小的解。
+- 空候选集返回 None；没有上一姿态时返回第一组候选解的副本。
+- 候选集必须能转换为形状为 (N, 2) 的有限浮点数组；上一姿态必须是两个有限关节角。
+- 该函数只负责局部连续性偏好，不负责关节限位、全局路径优化或速度/加速度约束。详见 [连续解析逆运动学解选择](../../docs/CONTINUOUS_IK.md)。
+
 ### `elbow_drag.py`
 
 - `solve_elbow_drag_candidates(mouse_position, link_lengths, line_direction, previous_target, tolerance=1e-9)`：求解拖动第二关节时的可行姿态。
@@ -113,6 +120,7 @@ for solution in filtered.valid_solutions:
 - 运动学模块只描述平面几何；动力学模块另行模拟刚性连杆质量、质心、平面转动惯量、重力和关节驱动力矩。
 - 雅可比矩阵只针对末端二维位置，不包括末端姿态。
 - 两连杆奇异边界测试不能覆盖空间六自由度机械臂的全部奇异类型。
+
 ### dynamics.py
 
 - `PlanarArmDynamics(...)`：建立二维平面刚性串联机械臂动力学模型。

@@ -23,7 +23,7 @@ def read_rows(path):
 
 
 def adaptive_ik(arm, target, initial, max_iterations=250, tolerance=1e-6,
-                base_damping=1e-3, sigma_threshold=0.05, gain=0.5, max_damping=0.2):
+                base_damping=1e-3, sigma_threshold=0.05, gain=0.5, max_damping=1.0):
     """DLS experiment: raise damping as the smallest Jacobian singular value falls."""
     q = np.asarray(initial, dtype=float).copy()
     best = q.copy()
@@ -41,26 +41,30 @@ def adaptive_ik(arm, target, initial, max_iterations=250, tolerance=1e-6,
         sigma_min = float(singular_values[-1]) if singular_values.size else 0.0
         extra = gain * max(0.0, sigma_threshold - sigma_min)
         damping = min(max_damping, base_damping + extra)
-        peak_damping = max(peak_damping, damping)
-        step = jac.T @ np.linalg.solve(jac @ jac.T + damping**2 * np.eye(2), error_vector)
-        norm = float(np.linalg.norm(step))
-        if norm > 0.25:
-            step *= 0.25 / norm
-        candidate = q + step
-        candidate_error = float(np.linalg.norm(arm.forward_kinematics(candidate)[-1] - target))
-        if candidate_error <= error:
-            q = candidate
-        else:
-            # Match the reference solver's rejection response without changing its implementation.
-            fallback = min(max_damping, min(damping * 4.0, 1.0))
-            peak_damping = max(peak_damping, fallback)
-            step = jac.T @ np.linalg.solve(jac @ jac.T + fallback**2 * np.eye(2), error_vector)
+        accepted = False
+        while True:
+            peak_damping = max(peak_damping, damping)
+            step = jac.T @ np.linalg.solve(
+                jac @ jac.T + damping**2 * np.eye(2), error_vector
+            )
             norm = float(np.linalg.norm(step))
             if norm > 0.25:
                 step *= 0.25 / norm
             candidate = q + step
-            if np.linalg.norm(arm.forward_kinematics(candidate)[-1] - target) <= error:
+            candidate_error = float(
+                np.linalg.norm(arm.forward_kinematics(candidate)[-1] - target)
+            )
+            if candidate_error < error or candidate_error <= tolerance:
                 q = candidate
+                if candidate_error < best_error:
+                    best, best_error = q.copy(), candidate_error
+                accepted = True
+                break
+            if damping >= max_damping:
+                break
+            damping = min(max_damping, damping * 4.0)
+        if not accepted:
+            return best, best_error, best_error <= tolerance, iteration, peak_damping
     return best, best_error, best_error <= tolerance, max_iterations, peak_damping
 
 
@@ -142,13 +146,13 @@ def main():
     (output / "阻尼策略汇总.json").write_text(
         json.dumps({"repeat": args.repeat, "candidate_parameters": {
             "base_damping": 1e-3, "sigma_threshold": args.sigma_threshold,
-            "gain": args.gain, "max_damping": 0.2
+            "gain": args.gain, "max_damping": 1.0
         }, "runs": summaries}, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8")
     report = [
         "# DLS 阻尼策略初步对照", "",
         f"- 重复次数：每个场景、每种方法 {args.repeat} 次。",
         "- 当前方法：现有 solve_n_link_ik，初始阻尼 1e-3。",
-        "- 候选方法：按最小奇异值提高阻尼；参数仅为实验初值，尚未调优。",
+        "- 候选方法：按最小奇异值提高阻尼，阻尼上限 1.0；参数仅为实验初值，尚未调优。",
         "- 两种方法使用相同的目标点序列、起始姿态、迭代上限和误差容差。",
         "- 耗时仅供同机同环境粗略比较；需多次重复并检查分布。", "",
         "| 场景 | 方法 | 成功率 | 最大末端误差 (m) | P95 耗时 (ms) | 最大关节步长 (rad) |",

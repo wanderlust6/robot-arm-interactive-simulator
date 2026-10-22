@@ -327,7 +327,16 @@ def plan_cartesian_path(
             local_progress = np.clip((progress[mask] - p0) / (p1 - p0), 0.0, 1.0)
             local_tau = np.interp(local_progress, inverse_blend, inverse_grid)
             exact_path_times.extend(segment_start_times[segment_index] + local_tau * segment_durations[segment_index])
-        times = np.unique(np.concatenate((regular_times, np.asarray(exact_path_times))))
+        candidate_times = np.sort(np.concatenate((regular_times, np.asarray(exact_path_times))))
+        # Regular samples and exact path samples can represent the same mathematical
+        # time but differ by a few floating-point ulps. np.unique only removes exact
+        # duplicates, leaving near-zero dt values that destabilize numerical gradients.
+        time_tolerance = 64.0 * np.finfo(float).eps * max(1.0, abs(duration))
+        merged_times = [float(candidate_times[0])]
+        for candidate_time in candidate_times[1:]:
+            if float(candidate_time) - merged_times[-1] > time_tolerance:
+                merged_times.append(float(candidate_time))
+        times = np.asarray(merged_times, dtype=float)
         segment_ids = np.searchsorted(segment_start_times[1:], times, side="right")
         segment_ids = np.minimum(segment_ids, len(segment_durations) - 1)
         tau = (times - segment_start_times[segment_ids]) / segment_durations[segment_ids]
