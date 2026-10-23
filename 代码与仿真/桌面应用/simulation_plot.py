@@ -1,4 +1,4 @@
-"""Configurable simulation plots and axis-selection dialogs."""
+﻿"""Configurable simulation plots and axis-selection dialogs."""
 
 import numpy as np
 from PySide6.QtCore import QPoint, Qt
@@ -25,6 +25,12 @@ VARIABLES = {
     "joint_velocity": ("关节角速度 (rad/s)", "角速度", "rad/s"),
     "joint_accel": ("关节角加速度 (rad/s²)", "角加速度", "rad/s²"),
     "joint_torque": ("关节驱动力矩 τ (N·m)", "力矩", "N·m"),
+    "min_singular_value": ("\u6700\u5c0f\u5947\u5f02\u503c \u03c3min (m)", "\u5947\u5f02\u6027\u8bca\u65ad", "m"),
+    "condition_number": ("雅可比条件数 κ", "奇异性诊断", ""),
+    "endpoint_error": ("末端跟踪误差 (m)", "误差", "m"),
+    "scheme_endpoint_error": ("方案末端跟踪误差 (m)", "方案诊断", "m"),
+    "scheme_min_singular_value": ("方案最小奇异值", "方案诊断", "m"),
+    "scheme_condition_number": ("方案雅可比条件数", "方案诊断", ""),
 }
 
 
@@ -125,8 +131,16 @@ class SimulationPlot(QWidget):
         self.setMouseTracking(True)
         self._drawn_points = []
         self._selected_point = None
+        self._min_singular_values = np.empty(0, dtype=float)
+        self._condition_numbers = np.empty(0, dtype=float)
+        self._endpoint_errors = np.empty(0, dtype=float)
+        self._scheme_series = []
+        self._scheme_states = {}
+        self.scheme_key = "continuous"
+        self.x_scheme_key = "continuous"
+        self.y_scheme_keys = []
 
-    def set_data(self, times, positions, angles, current_time, duration, torques=None, joint_velocities=None, joint_accelerations=None):
+    def set_data(self, times, positions, angles, current_time, duration, torques=None, joint_velocities=None, joint_accelerations=None, min_singular_values=None, condition_numbers=None, endpoint_errors=None, scheme_series=None, scheme_states=None):
         self._times = np.asarray(times, dtype=float).copy()
         pos = np.asarray(positions, dtype=float)
         if pos.size == 0:
@@ -143,23 +157,66 @@ class SimulationPlot(QWidget):
         acceleration_values = np.asarray(joint_accelerations, dtype=float) if joint_accelerations is not None else np.empty((0, 0), dtype=float)
         self._joint_velocities = velocity_values.copy() if velocity_values.size else np.empty((0, 0), dtype=float)
         self._joint_accelerations = acceleration_values.copy() if acceleration_values.size else np.empty((0, 0), dtype=float)
+        self._min_singular_values = np.asarray(min_singular_values, dtype=float).copy() if min_singular_values is not None else np.empty(0, dtype=float)
+        self._condition_numbers = np.asarray(condition_numbers, dtype=float).copy() if condition_numbers is not None else np.empty(0, dtype=float)
+        self._endpoint_errors = np.asarray(endpoint_errors, dtype=float).copy() if endpoint_errors is not None else np.empty(0, dtype=float)
+        self._scheme_series = list(scheme_series or [])
+        self._scheme_states = dict(scheme_states or {})
         self._current_time = max(0.0, float(current_time))
         self._duration = max(float(duration), 1e-9)
         self.update()
 
-    def set_configuration(self, x_variable, y_variables, display_mode="separate"):
+    def set_configuration(self, x_variable, y_variables, display_mode="separate", x_scheme_key="continuous", y_scheme_keys=None):
         self.x_variable = x_variable
         self.y_variables = list(y_variables) or ["node_x:0"]
         self.display_mode = display_mode
+        self.x_scheme_key = x_scheme_key or "continuous"
+        self.y_scheme_keys = list(y_scheme_keys or ["continuous"] * len(self.y_variables))
+        while len(self.y_scheme_keys) < len(self.y_variables):
+            self.y_scheme_keys.append("continuous")
+        self.scheme_key = self.x_scheme_key
         self.update()
 
-    def _values(self, key):
+    def _values(self, key, scheme_key=None):
         kind, index = parse_variable(key)
         count = len(self._times)
         if kind == "time":
             return self._times.copy()
-        if not count:
-            return np.array([], dtype=float)
+        if not count: return np.array([], dtype=float)
+        selected_scheme = scheme_key or self.scheme_key
+        state = self._scheme_states.get(selected_scheme, {})
+        sp = np.asarray(state.get("positions", []), dtype=float)
+        sa = np.asarray(state.get("angles", []), dtype=float)
+        if len(sp) == count and len(sa) == count:
+            if kind == "path":
+                node=min(max(index,0),sp.shape[1]-1); pts=sp[:,node,:]
+                return np.r_[0.0,np.cumsum(np.linalg.norm(np.diff(pts,axis=0),axis=1))]
+            if kind.startswith("node_"):
+                node=min(max(index,0),sp.shape[1]-1); coords=sp[:,node,:]
+                vel=np.gradient(coords,self._times,axis=0,edge_order=1) if count>1 else np.zeros_like(coords)
+                acc=np.gradient(vel,self._times,axis=0,edge_order=1) if count>2 else np.zeros_like(coords)
+                if kind=="node_x": return coords[:,0]
+                if kind=="node_y": return coords[:,1]
+                if kind=="node_vx": return vel[:,0]
+                if kind=="node_vy": return vel[:,1]
+                if kind=="node_speed": return np.linalg.norm(vel,axis=1)
+                if kind=="node_ax": return acc[:,0]
+                if kind=="node_ay": return acc[:,1]
+                if kind=="node_accel": return np.linalg.norm(acc,axis=1)
+            if kind=="joint_angle": return np.degrees(sa[:,index]) if index<sa.shape[1] else np.zeros(count)
+            if kind=="link_angle": return np.degrees(np.cumsum(sa,axis=1)[:,index]) if index<sa.shape[1] else np.zeros(count)
+            if kind in ("joint_velocity", "joint_accel"):
+                if index >= sa.shape[1]:
+                    return np.zeros(count)
+                # Derive velocity/acceleration from this scheme's own recorded joint angles.
+                # Do not fall back to the currently active trajectory, which would make
+                # two different planning schemes appear to have identical curves.
+                unwrapped = np.unwrap(sa, axis=0)
+                scheme_velocity = np.gradient(unwrapped, self._times, axis=0, edge_order=1) if count > 1 else np.zeros_like(unwrapped)
+                if kind == "joint_velocity":
+                    return scheme_velocity[:, index]
+                scheme_acceleration = np.gradient(scheme_velocity, self._times, axis=0, edge_order=1) if count > 2 else np.zeros_like(unwrapped)
+                return scheme_acceleration[:, index]
         if kind == "path":
             node = min(max(index, 0), self._positions.shape[1] - 1)
             points = self._positions[:, node, :]
@@ -179,6 +236,22 @@ class SimulationPlot(QWidget):
             if kind == "node_ax": return acceleration[:, 0]
             if kind == "node_ay": return acceleration[:, 1]
             if kind == "node_accel": return np.linalg.norm(acceleration, axis=1)
+        if kind == "min_singular_value":
+            return self._min_singular_values.copy() if len(self._min_singular_values) == count else np.zeros(count)
+        if kind == "condition_number":
+            return self._condition_numbers.copy() if len(self._condition_numbers) == count else np.zeros(count)
+        if kind == "endpoint_error":
+            return self._endpoint_errors.copy() if len(self._endpoint_errors) == count else np.zeros(count)
+        if kind in ("scheme_endpoint_error", "scheme_min_singular_value", "scheme_condition_number"):
+            if index >= len(self._scheme_series):
+                return np.full(count, np.nan)
+            field = {
+                "scheme_endpoint_error": "endpoint_errors",
+                "scheme_min_singular_value": "min_singular_values",
+                "scheme_condition_number": "condition_numbers",
+            }[kind]
+            values = np.asarray(self._scheme_series[index].get(field, []), dtype=float)
+            return values.copy() if len(values) == count else np.full(count, np.nan)
         if kind == "joint_torque":
             return self._torques[:, index] if index < self._torques.shape[1] else np.zeros(count)
         if kind.startswith("joint_") or kind == "link_angle":
@@ -201,8 +274,8 @@ class SimulationPlot(QWidget):
                 return np.gradient(velocity, self._times, axis=0, edge_order=1) if count > 2 else np.zeros(count)
         return np.zeros(count)
 
-    def _x_values(self):
-        return self._values(self.x_variable)
+    def _x_values(self, scheme_key=None):
+        return self._values(self.x_variable, scheme_key or self.x_scheme_key)
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton and self._drawn_points:
@@ -230,15 +303,18 @@ class SimulationPlot(QWidget):
             painter.drawText(16, 44, "准备或运行仿真后显示曲线")
             painter.end()
             return
-        x = self._x_values()
+        x = self._x_values(self.x_scheme_key)
         self._drawn_points = []
-        series = [(key, self._values(key)) for key in self.y_variables]
-        valid = [(key, values) for key, values in series if len(values) == len(x)]
+        series = [
+            (key, self._values(key, scheme), scheme)
+            for key, scheme in zip(self.y_variables, self.y_scheme_keys)
+        ]
+        valid = [(key, values, scheme) for key, values, scheme in series if len(values) == len(x)]
         if not valid:
             painter.drawText(16, 44, "请选择有效曲线")
             painter.end()
             return
-        units = [VARIABLES.get(parse_variable(key)[0], ("", "", ""))[2] for key, _ in valid]
+        units = [VARIABLES.get(parse_variable(key)[0], ("", "", ""))[2] for key, _, _scheme in valid]
         different = len(set(units)) > 1
         separate = self.display_mode == "separate" and different
         groups = [[item] for item in valid] if separate else [valid]
@@ -250,7 +326,7 @@ class SimulationPlot(QWidget):
             area_bottom = area_top + panel_h
             painter.setPen(QPen(QColor("#cbd5e1"), 1))
             painter.drawRect(left, area_top, max(10, self.width() - left - right), panel_h)
-            all_values = np.concatenate([values[np.isfinite(values)] for _, values in group if np.any(np.isfinite(values))]) if any(np.any(np.isfinite(values)) for _, values in group) else np.array([0.0])
+            all_values = np.concatenate([values[np.isfinite(values)] for _, values, _scheme in group if np.any(np.isfinite(values))]) if any(np.any(np.isfinite(values)) for _, values, _scheme in group) else np.array([0.0])
             xfinite = x[np.isfinite(x)]
             xmin, xmax = (float(np.min(xfinite)), float(np.max(xfinite))) if len(xfinite) else (0.0, 1.0)
             if abs(xmax - xmin) < 1e-12: xmax = xmin + 1.0
@@ -273,7 +349,7 @@ class SimulationPlot(QWidget):
                 x_value = xmin + fraction * (xmax - xmin)
                 painter.drawLine(int(tick_x), area_bottom, int(tick_x), area_bottom + 4)
                 painter.drawText(int(tick_x - 15), area_bottom + 14, f"{x_value:.3g}")
-            for curve_index, (key, values) in enumerate(group):
+            for curve_index, (key, values, scheme) in enumerate(group):
                 color = QColor.fromHsv((curve_index * 67 + 205) % 360, 190, 190)
                 points = []
                 for xv, yv in zip(x, values):
@@ -294,9 +370,31 @@ class SimulationPlot(QWidget):
                         if previous is not None:
                             painter.drawLine(previous[0], previous[1], point[0], point[1])
                         previous = point
-                label = VARIABLES.get(parse_variable(key)[0], (key, "", ""))[0]
+                kind, series_index = parse_variable(key)
+                label = VARIABLES.get(kind, (key, "", ""))[0]
+                if kind.startswith("scheme_") and series_index < len(self._scheme_series):
+                    label = f"{self._scheme_series[series_index].get('label', '方案')} · {label}"
                 painter.setPen(color)
+                scheme_label = next((item.get("label", scheme) for item in self._scheme_series if item.get("key") == scheme), scheme)
+                label = f"{scheme_label} · {label}"
                 painter.drawText(4, area_top + 15 + curve_index * 14, label)
+            if len(self._times) > 0 and len(x) == len(self._times):
+                finite_pairs = np.isfinite(self._times) & np.isfinite(x)
+                if np.count_nonzero(finite_pairs) >= 2:
+                    marker_x_value = float(np.interp(
+                        self._current_time,
+                        self._times[finite_pairs],
+                        x[finite_pairs],
+                    ))
+                    if xmin <= marker_x_value <= xmax:
+                        marker_x = int(
+                            left + (marker_x_value - xmin) / (xmax - xmin)
+                            * (self.width() - left - right)
+                        )
+                        painter.setPen(QPen(
+                            QColor("#dc2626"), 1.5, Qt.PenStyle.DashLine
+                        ))
+                        painter.drawLine(marker_x, area_top, marker_x, area_bottom)
             painter.setPen(QColor("#475569"))
             x_label = VARIABLES.get(parse_variable(self.x_variable)[0], (self.x_variable, "", ""))[0]
             painter.drawText(left, min(self.height() - 4, area_bottom + 29), x_label)

@@ -797,6 +797,64 @@ class TestDesktopPrototype(unittest.TestCase):
         self.assertIn("数量与机械臂关节数量不一致", self.window.status_label.text())
 
 
+    def test_workspace_shadow_arm_uses_its_own_joint_angles(self):
+        shadow_angles = np.radians([35.0, -20.0, 15.0])
+        self.window.workspace.set_shadow_state(shadow_angles, "ready")
+
+        shadow_positions = self.window.workspace._shadow_joint_positions()
+        expected_positions = self.window.arm.forward_kinematics(shadow_angles)
+
+        np.testing.assert_allclose(shadow_positions, expected_positions, atol=1e-12)
+        self.assertFalse(np.allclose(shadow_angles, self.window.joint_angles))
+        self.assertEqual(self.window.workspace._shadow_status, "ready")
+        self.window.show()
+        self.application.processEvents()
+        self.assertFalse(self.window.workspace.grab().isNull())
+
+        self.window.workspace.set_shadow_state(None, "failed")
+        self.assertIsNone(self.window.workspace._shadow_joint_angles)
+        self.assertEqual(self.window.workspace._shadow_status, "failed")
+
+    def test_shadow_arm_follows_shared_path_progress_during_playback(self):
+        from scipy.interpolate import CubicHermiteSpline
+
+        main_angles = np.vstack((
+            np.radians([90.0, -90.0, 90.0]),
+            np.radians([80.0, -70.0, 75.0]),
+        ))
+        shadow_angles = np.vstack((
+            np.radians([90.0, -90.0, 90.0]),
+            np.radians([65.0, -50.0, 55.0]),
+        ))
+        self.window._simulation_times = np.array([0.0, 1.0])
+        self.window._simulation_points = np.array([[1.0, 1.0], [1.2, 1.0]])
+        self.window._simulation_duration = 1.0
+        self.window._simulation_time = 0.0
+        self.window._planned_joint_angles = main_angles
+        self.window._planned_path_progress = np.array([0.0, 1.0])
+        self.window._planned_path_spline = CubicHermiteSpline(
+            [0.0, 1.0], main_angles, np.zeros_like(main_angles), axis=0
+        )
+        self.window._shadow_joint_angles = shadow_angles
+        self.window._shadow_plan_times = np.array([0.0, 2.0])
+        self.window._shadow_path_progress = np.array([0.0, 1.0])
+        self.window._shadow_path_spline = CubicHermiteSpline(
+            [0.0, 2.0], shadow_angles, np.zeros_like(shadow_angles), axis=0
+        )
+        self.window._shadow_plan_status = "ready"
+        self.window._simulation_timer.setInterval(100)
+
+        self.window._advance_simulation()
+
+        self.assertAlmostEqual(self.window._simulation_time, 0.1)
+        expected_shadow = self.window._shadow_path_spline(0.2)
+        np.testing.assert_allclose(
+            self.window.workspace._shadow_joint_angles, expected_shadow, atol=1e-10
+        )
+        self.assertFalse(np.allclose(
+            self.window.workspace._shadow_joint_angles, self.window.joint_angles
+        ))
+
     def test_simulation_plot_records_actual_state_on_shared_time_axis(self):
         self.window._simulation_duration = 2.0
         self.window._simulation_time = 0.5
@@ -808,6 +866,68 @@ class TestDesktopPrototype(unittest.TestCase):
         np.testing.assert_allclose(self.window._simulation_log_angles[0], self.window.joint_angles)
         self.assertEqual(self.window.simulation_plot._current_time, 0.5)
         self.assertEqual(self.window.simulation_plot._duration, 2.0)
+        metrics = self.window.arm.singularity_metrics(self.window.joint_angles)
+        self.assertEqual(len(self.window._simulation_log_min_singular_values), 1)
+        self.assertEqual(len(self.window._simulation_log_condition_numbers), 1)
+        self.assertEqual(len(self.window._simulation_log_endpoint_errors), 1)
+        self.assertAlmostEqual(self.window._simulation_log_min_singular_values[0], metrics["min_singular_value"])
+        self.assertAlmostEqual(self.window.simulation_plot._values("min_singular_value:0")[0], metrics["min_singular_value"])
+        self.assertAlmostEqual(self.window.simulation_plot._values("condition_number:0")[0], metrics["condition_number"])
+        self.assertAlmostEqual(self.window.simulation_plot._values("endpoint_error:0")[0], 0.0)
+        self.assertIn("0.50", self.window.simulation_diagnostics_label.text())
+
+    def test_data_column_options_include_each_scheme_diagnostic(self):
+        window = self.window
+        window.workspace._path_anchors = [
+            (np.array([1.0, 1.0]), None, None),
+            (np.array([1.2, 1.0]), None, None),
+        ]
+        window.simulation_route_indices = [0, 1]
+        window.motion_path_checks["continuous"].setChecked(True)
+        window.motion_path_checks["joint_bias"].setChecked(True)
+        window._prepare_simulation()
+        variables = dict(window._plot_variables())
+        self.assertIn("scheme_endpoint_error:0", variables)
+        self.assertIn("scheme_endpoint_error:1", variables)
+        self.assertIn("scheme_min_singular_value:0", variables)
+        self.assertIn("scheme_condition_number:1", variables)
+
+    def test_plot_window_receives_diagnostic_series(self):
+        self.window._open_plot_window()
+        self.window._record_simulation_state(0.25)
+
+        metrics = self.window.arm.singularity_metrics(self.window.joint_angles)
+        for plot in self.window._plot_widgets:
+            self.assertAlmostEqual(plot._values("min_singular_value:0")[0], metrics["min_singular_value"])
+            self.assertAlmostEqual(plot._values("condition_number:0")[0], metrics["condition_number"])
+            self.assertAlmostEqual(plot._values("endpoint_error:0")[0], 0.0)
+        self.window._plot_window.close()
+
+    def test_diagnostics_panel_updates_joint_limit_status_from_sample(self):
+        self.window.lower_limit_enabled[0].setChecked(True)
+        self.window.lower_controls[0].setValue(0.0)
+        self.window.joint_angles[0] = -0.1
+
+        self.window._record_simulation_state(0.25)
+
+        self.assertIn("\u4f4e\u4e8e\u4e0b\u9650", self.window.simulation_diagnostics_label.text())
+
+    def test_endpoint_error_uses_reference_path_on_simulation_time_axis(self):
+        self.window.joint_angles = np.zeros(self.window.arm.joint_count, dtype=float)
+        self.window.target = np.array([0.0, 0.0])
+        self.window._simulation_times = np.array([0.0, 1.0])
+        self.window._simulation_points = np.array([[0.0, 0.0], [1.0, 0.0]])
+
+        self.window._record_simulation_state(0.5)
+
+        actual = self.window.arm.forward_kinematics(self.window.joint_angles)[-1]
+        expected_error = np.linalg.norm(actual - np.array([0.5, 0.0]))
+        self.assertAlmostEqual(self.window._simulation_log_endpoint_errors[0], expected_error)
+        self.assertAlmostEqual(self.window.simulation_plot._values("endpoint_error:0")[0], expected_error)
+        options = dict(self.window._plot_variables())
+        self.assertIn("min_singular_value:0", options)
+        self.assertIn("condition_number:0", options)
+        self.assertIn("endpoint_error:0", options)
 
     def test_simulation_plot_data_is_reset_for_a_new_run(self):
         self.window._record_simulation_state(0.0)
@@ -815,6 +935,9 @@ class TestDesktopPrototype(unittest.TestCase):
         self.window._clear_simulation_log()
 
         self.assertEqual(self.window._simulation_log_times, [])
+        self.assertEqual(self.window._simulation_log_min_singular_values, [])
+        self.assertEqual(self.window._simulation_log_condition_numbers, [])
+        self.assertEqual(self.window._simulation_log_endpoint_errors, [])
         self.assertEqual(self.window.simulation_plot._times.size, 0)
         self.assertEqual(self.window.simulation_plot._positions.shape[0], 0)
 

@@ -31,6 +31,8 @@ class ArmWorkspace(QWidget):
         self._target = np.array([math.sqrt(2), 0.0], dtype=float)
         self._target_status = "valid"
         self._fixed_nodes = {}
+        self._shadow_joint_angles = None
+        self._shadow_status = "disabled"
         self._zoom = 1.0
         self._view_offset = QPointF(0.0, 0.0)
         self._panning = False
@@ -148,6 +150,28 @@ class ArmWorkspace(QWidget):
         }
         self.update()
 
+    def set_shadow_state(self, joint_angles=None, status="disabled"):
+        """设置对比算法的独立影子机械臂姿态和状态。"""
+        if joint_angles is None:
+            self._shadow_joint_angles = None
+        else:
+            angles = np.asarray(joint_angles, dtype=float)
+            if angles.shape != self._joint_angles.shape or not np.all(np.isfinite(angles)):
+                raise ValueError("影子机械臂关节角必须与主机械臂维度一致且为有限值")
+            self._shadow_joint_angles = angles.copy()
+        self._shadow_status = str(status)
+        self.update()
+
+    def _shadow_joint_positions(self):
+        if self._shadow_joint_angles is None:
+            return None
+        absolute_angles = np.cumsum(self._shadow_joint_angles)
+        vectors = np.column_stack((
+            self._link_lengths * np.cos(absolute_angles),
+            self._link_lengths * np.sin(absolute_angles),
+        ))
+        return np.vstack((np.zeros((1, 2)), np.cumsum(vectors, axis=0)))
+
     def _base_view_parameters(self):
         total_length = max(float(np.sum(self._link_lengths)), 0.5)
         width = max(self.width(), 1)
@@ -220,6 +244,22 @@ class ArmWorkspace(QWidget):
         self._draw_grid(painter, origin, scale)
         self._draw_drag_line(painter, origin, scale)
 
+        shadow_positions = self._shadow_joint_positions()
+        if shadow_positions is not None:
+            shadow_points = [self._world_to_screen(point, origin, scale) for point in shadow_positions]
+            for index in range(len(shadow_points) - 1):
+                shadow_pen = QPen(QColor("#e87524"), 8)
+                shadow_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+                painter.setPen(shadow_pen)
+                painter.drawLine(shadow_points[index], shadow_points[index + 1])
+            for point in shadow_points[:-1]:
+                painter.setPen(QPen(QColor("#fff7ed"), 2))
+                painter.setBrush(QColor("#c65d16"))
+                painter.drawEllipse(point, 5, 5)
+            painter.setPen(QPen(QColor("#c65d16"), 2))
+            painter.setBrush(QColor("#fff7ed"))
+            painter.drawEllipse(shadow_points[-1], 6, 6)
+
         positions = self._joint_positions()
         screen_points = [self._world_to_screen(point, origin, scale) for point in positions]
 
@@ -274,6 +314,12 @@ class ArmWorkspace(QWidget):
 
         painter.setPen(QColor("#27364b"))
         painter.drawText(18, 28, "二维机械臂工作区（坐标单位：m）")
+        if self._shadow_status == "failed":
+            painter.setPen(QColor("#b42318"))
+            painter.drawText(18, 72, "影子机械臂：规划失败（未绘制虚假轨迹）")
+        elif self._shadow_joint_angles is not None:
+            painter.setPen(QColor("#c65d16"))
+            painter.drawText(18, 72, "橙色：影子机械臂（独立算法关节轨迹）")
         painter.setPen(QColor("#63738a"))
         instruction = (
             "轨迹编辑：单击添加直线锚点，按住拖动创建曲线锚点"

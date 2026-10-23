@@ -151,3 +151,57 @@ for solution in filtered.valid_solutions:
 - `plan_cartesian_path(...)`：对用户给定的笛卡尔路径连续求解数值逆运动学，再进行时间标定和动力学约束检查，支持任意连杆数量。
 - `plan_cartesian_line(...)`：提供两连杆机械臂笛卡尔直线的解析逆运动学路径生成。
 - 自动延时只会改变时间参数，不会修复几何不可达、关节限位冲突或静态重力力矩已超限等问题；搜索结果是当前固定路径上的可行解，不保证全局最短时间。所有速度、加速度与力矩检查均基于离散采样，实际执行仍需留出安全裕度。
+
+### `ik_experiment_runner.py`：配对逆运动学实验
+
+- `validate_config(config)`：检查实验标识、连杆长度、迭代次数、误差容差和阻尼参数。
+- `run_paired_sequence(arm, targets, initial_angles, config)`：在相同目标序列和初始关节角下分别运行当前 DLS 与奇异值自适应 DLS，返回逐点记录和序列汇总。
+- `write_results(output_dir, config, result)`：导出 `experiment_config.json`、`point_results.csv`、`sequence_summary.csv`、`summary.json` 与 `report.md`。若输出目录已存在且非空，将拒绝覆盖。
+- 逐点结果包括目标坐标、求解前后关节角、实际末端误差、收敛标志、求解前后最小奇异值、条件数、雅可比秩、关节步长和耗时。当前 DLS 不返回迭代次数及阻尼历史，对应字段可能为空，不能解释为空值就是零。
+- 命令行配置必须包含 `experiment_id`、`scenario_id`、`robot.link_lengths_m`、`solver`、`targets_m` 和 `initial_angles_rad`。`solver` 包含 `max_iterations`、`tolerance_m`、`base_damping`、`sigma_threshold`、`gain`、`max_damping`。
+
+在本目录运行：
+
+```powershell
+python ik_experiment_runner.py --config path\to\experiment.json --output path\to\new-results
+python -m unittest test_ik_experiment_runner -v
+```
+
+输出目录应为本次实验新建的独立目录。本模块是离线实验原型，尚未实现完整的路径可达性预检、逐迭代阻尼历史和独立风险预警评估。
+
+### `ik_experiment_design.py`：自动实验场景生成
+
+- `ExperimentScenario` 统一保存场景 ID、场景类型、目标序列（m）、初始关节角（rad）和元数据，并校验数组形状及有限数值。
+- `generate_workspace_boundary_scenarios(...)` 生成内工作空间边界、外边界和普通可达区域三个场景；边界偏移量与采样数可配置。
+- `generate_initial_sensitivity_scenarios(...)` 固定目标序列，对初始关节角按指定幅度做均匀随机扰动。
+- `generate_target_perturbation_scenarios(...)` 固定初始关节角，对基准目标序列添加独立高斯坐标扰动。
+- 三类生成器均支持固定 `seed`，相同输入和种子会生成相同场景。初值扰动幅度单位为 rad，目标扰动标准差单位为 m。
+- `ExperimentScenario.to_experiment_config(base_config)` 可将场景注入现有执行器配置；`write_scenario_manifest(path, scenarios, seed=...)` 将完整场景清单导出为 JSON，并拒绝覆盖已有文件。
+- 场景生成仅负责设计输入，不代表目标一定能从指定初值收敛；实际可达性和求解表现应由 `ik_experiment_runner.py` 评估。当前自动生成器是可复现的离线实验工具，尚未自动搜索最优采样密度或根据实验结果自适应挑选下一组场景。
+
+在本目录运行专项测试：
+
+```powershell
+python -m unittest test_ik_experiment_design -v
+```
+#### 实验输入预检与失败分类补充
+
+- `validate_experiment_inputs(config)` 校验 `targets_m` 为有限的非空 N×2 坐标数组，并检查 `initial_angles_rad` 与机械臂自由度一致。
+- 执行器会按平面串联机械臂的径向工作空间边界逐目标预检几何可达性，并在逐点 CSV 中记录目标半径、内外工作空间半径及 `target_reachable`。
+- `failure_code` 可同时记录 `unreachable_target`、`non_convergence`、`endpoint_error_exceeded`；不可达目标标记与求解器是否收敛相互独立。
+- `sequence_summary.csv` 和 `summary.json` 分别提供整条序列成功状态、点成功率、不可达目标计数和求解失败计数。任何一个目标点失败，整条序列都不算成功。
+- 导出前会先验证配置和 JSON 汇总可序列化；发现非有限 JSON 数值时不会创建部分结果目录。已有非空输出目录仍会被拒绝覆盖。
+- 该预检只判断目标点是否处于几何工作空间内，不等于对整条路径的连续可行性、关节限位或分支连续性进行完整证明。
+
+### `ik_experiment_batch.py`：批次组织与批量执行
+
+- `run_experiment_batch(scenarios, base_config, output_dir)`：预检场景 ID、配置、初值维度与输出路径，然后逐场景调用现有配对执行器。
+- 每个场景独立保存执行器原有的五类结果文件；批次根目录额外生成 `batch_summary.json` 和 `batch_summary.csv`，用于跨场景比较两种求解方法。
+- 批次执行会拒绝重复或不安全的场景目录名、无效配置和非空输出目录，并且不会修改调用方传入的基础配置。
+- 命令行入口读取基础配置和 `ik_experiment_design.py` 导出的场景清单：
+
+```powershell
+python ik_experiment_batch.py --config path\to\base_config.json --manifest path\to\scenario_manifest.json --output path\to\new-batch
+```
+
+- 当前采用顺序执行；若某个场景在求解过程中发生运行时异常，批次会停止并保留已经写出的场景结果，不会伪装成完整成功批次。请为每次批次使用新的输出目录。

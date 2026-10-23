@@ -1,4 +1,4 @@
-"""基于五次时间标定的机械臂约束轨迹规划。"""
+﻿"""基于五次时间标定的机械臂约束轨迹规划。"""
 
 from dataclasses import dataclass
 from typing import Optional
@@ -27,6 +27,7 @@ class TrajectoryPlanResult:
     iterations: int
     path_progress: Optional[np.ndarray] = None
     path_joint_angles: Optional[np.ndarray] = None
+    time_progress: Optional[np.ndarray] = None
 
 
 def _validate_limits(values, count, name):
@@ -94,9 +95,10 @@ def plan_joint_trajectory(
     a_limit = _validate_limits(max_acceleration, n, "角加速度上限")
     t_limit = _validate_limits(max_torque, n, "力矩上限")
     duration = float(initial_duration)
-    max_duration = float(max_duration)
+    max_duration = None if max_duration is None else float(max_duration)
     growth = float(duration_growth)
-    if not np.isfinite(duration) or duration <= 0 or not np.isfinite(max_duration) or max_duration < duration:
+    if (not np.isfinite(duration) or duration <= 0
+            or (max_duration is not None and (not np.isfinite(max_duration) or max_duration < duration))):
         raise ValueError("初始运动时间和最大搜索时间必须有效，且最大时间不小于初始时间")
     if not np.isfinite(growth) or growth <= 1.0:
         raise ValueError("duration_growth 必须大于 1")
@@ -119,7 +121,7 @@ def plan_joint_trajectory(
 
     last_result = None
     for iteration in range(1, int(max_iterations) + 1):
-        if duration > max_duration * (1.0 + 1e-12):
+        if max_duration is not None and duration > max_duration * (1.0 + 1e-12):
             break
         times, angles, velocities, accelerations = quintic_time_scaling(
             start, end, duration, sample_count
@@ -134,9 +136,9 @@ def plan_joint_trajectory(
         torque_ok = np.all(np.abs(torques) <= t_limit[None, :] * (1.0 + 1e-9))
         if speed_ok and accel_ok and torque_ok:
             return TrajectoryPlanResult(True, "已找到满足所设速度、加速度和力矩上限的轨迹。", *last_result, duration, iteration)
-        if duration >= max_duration:
+        if max_duration is not None and duration >= max_duration:
             break
-        duration = min(duration * growth, max_duration)
+        duration = duration * growth if max_duration is None else min(duration * growth, max_duration)
 
     if last_result is None:
         empty = np.empty((0, n), dtype=float)
@@ -222,11 +224,13 @@ def plan_cartesian_path(
     sample_count=201,
     max_duration=120.0,
     max_iterations=60,
+    time_search_resolution=0.1,
     joint_limits=None,
     pose_constraints=None,
     corner_indices=None,
     max_end_effector_speed=np.inf,
     max_joint_jerk=np.inf,
+    ik_solver=None,
 ):
     """沿给定笛卡尔路径连续求逆运动学，并自动搜索满足约束的运动时间。
 
@@ -269,7 +273,9 @@ def plan_cartesian_path(
             error = float(np.linalg.norm(arm.forward_kinematics(angles)[-1] - point))
             converged = error <= 1e-5
         else:
-            angles, error, converged = solve_n_link_ik(arm, point, previous, limits=limits)
+            solver = solve_n_link_ik if ik_solver is None else ik_solver
+            solution = solver(arm, point, previous, limits=limits)
+            angles, error, converged = solution[:3]
         if not converged or error > 1e-5:
             raise ValueError(f"路径第 {index + 1} 个点不可达或逆运动学未收敛（误差 {error:.3g}）")
         if limits is not None and (np.any(angles < limits.lower - 1e-9) or np.any(angles > limits.upper + 1e-9)):
@@ -295,9 +301,12 @@ def plan_cartesian_path(
     if np.isnan(jerk_limit) or jerk_limit <= 0:
         raise ValueError("关节角加加速度上限必须为正数")
     duration = float(initial_duration)
-    max_duration = float(max_duration)
-    if not np.isfinite(duration) or duration <= 0 or not np.isfinite(max_duration) or max_duration < duration:
-        raise ValueError("初始运动时间和最大搜索时间必须有效，且最大时间不小于初始时间")
+    max_duration = None if max_duration is None else float(max_duration)
+    time_search_resolution = float(time_search_resolution)
+    if (not np.isfinite(duration) or duration <= 0
+            or (max_duration is not None and (not np.isfinite(max_duration) or max_duration < duration))
+            or not np.isfinite(time_search_resolution) or time_search_resolution <= 0):
+        raise ValueError("初始运动时间、最大搜索时间和精细搜索分辨率必须有效")
     # 每个拐点都切分关节路径插值器，禁止插值器跨越拐点把两侧路径混在一起。
     # 分段五次时间标定负责停速；几何采样点和拐点坐标本身均不移动。
     raw_corners = () if corner_indices is None else tuple(corner_indices)
@@ -314,6 +323,10 @@ def plan_cartesian_path(
             raise ValueError("拐点之间的路径采样点不足，无法保持分段轨迹")
         path_splines.append(PchipInterpolator(progress[mask], joint_path[mask], axis=0))
     last = None
+    previous_duration = None
+    refining = False
+    coarse_feasible = None
+    refinement_upper_duration = None
     inverse_grid = np.linspace(0.0, 1.0, 20001)
     inverse_blend = 10.0 * inverse_grid**3 - 15.0 * inverse_grid**4 + 6.0 * inverse_grid**5
 
@@ -371,10 +384,27 @@ def plan_cartesian_path(
                   and np.max(end_effector_speeds) <= end_speed_limit * (1 + 1e-9)
                   and np.max(np.abs(jerks)) <= jerk_limit * (1 + 1e-9))
         if passed:
-            return TrajectoryPlanResult(True, "已找到满足所设速度、加速度、力矩、末端线速度和角加加速度上限的笛卡尔路径轨迹。", *last[:5], duration, iteration, progress.copy(), joint_path.copy())
-        if duration >= max_duration:
+            if not refining:
+                coarse_feasible = (last, float(duration), int(iteration), progress_at_time.copy())
+                if previous_duration is not None and duration - previous_duration > time_search_resolution:
+                    refinement_upper_duration = float(duration)
+                    refining = True
+                    duration = min(previous_duration + time_search_resolution, refinement_upper_duration)
+                    continue
+                return TrajectoryPlanResult(True, "已找到满足所设约束的轨迹。", *last[:5], duration, iteration, progress.copy(), joint_path.copy(), progress_at_time.copy())
+            return TrajectoryPlanResult(True, "已找到满足所设约束的轨迹；总时间已在粗搜索区间内按设定分辨率精细搜索。", *last[:5], duration, iteration, progress.copy(), joint_path.copy(), progress_at_time.copy())
+        if refining:
+            next_duration = duration + time_search_resolution
+            if next_duration >= refinement_upper_duration - 1e-12:
+                best_last, best_duration, best_iteration, best_progress = coarse_feasible
+                best_times, best_angles, best_velocities, best_accelerations, best_torques, _, _ = best_last
+                return TrajectoryPlanResult(True, "已找到满足所设约束的轨迹；精细搜索未找到更短的可行候选，返回粗搜索可行时间。", best_times, best_angles, best_velocities, best_accelerations, best_torques, best_duration, best_iteration, progress.copy(), joint_path.copy(), best_progress)
+            duration = next_duration
+            continue
+        previous_duration = float(duration)
+        if max_duration is not None and duration >= max_duration:
             break
-        duration = min(duration * 1.25, max_duration)
+        duration = duration * 1.25 if max_duration is None else min(duration * 1.25, max_duration)
     times, angles, velocities, accelerations, torques, jerks, end_effector_speeds = last
     diagnostics = []
     if np.max(end_effector_speeds) > end_speed_limit * (1 + 1e-9):
@@ -401,4 +431,4 @@ def plan_cartesian_path(
         "在最长搜索时间内仍无法满足约束。" + "；".join(diagnostics)
         + "。可尝试放宽对应限制，或调整路径/机械臂参数。"
     )
-    return TrajectoryPlanResult(False, message, times, angles, velocities, accelerations, torques, float(times[-1]), int(iteration), progress.copy(), joint_path.copy())
+    return TrajectoryPlanResult(False, message, times, angles, velocities, accelerations, torques, float(times[-1]), int(iteration), progress.copy(), joint_path.copy(), progress_at_time.copy())

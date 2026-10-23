@@ -45,6 +45,20 @@ class TestContinuousIKSelection(unittest.TestCase):
     def test_empty_candidate_list_returns_none(self):
         self.assertIsNone(select_continuous_ik_solution([], np.zeros(2)))
 
+    def test_empty_numpy_candidate_array_returns_none(self):
+        self.assertIsNone(select_continuous_ik_solution(np.empty((0, 2)), np.zeros(2)))
+
+    def test_rejects_candidates_with_wrong_shape(self):
+        with self.assertRaises(ValueError):
+            select_continuous_ik_solution([[0.1, 0.2, 0.3]], np.zeros(2))
+
+    def test_rejects_non_finite_candidate_angles(self):
+        with self.assertRaises(ValueError):
+            select_continuous_ik_solution([[np.nan, 0.2]], np.zeros(2))
+
+    def test_rejects_invalid_previous_angles(self):
+        with self.assertRaises(ValueError):
+            select_continuous_ik_solution([[0.1, 0.2]], [np.inf, 0.0])
 
     def test_accepts_numpy_array_as_candidate_collection(self):
         candidates = np.radians([[20.0, 30.0], [-20.0, -30.0]])
