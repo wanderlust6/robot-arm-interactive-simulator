@@ -1,0 +1,84 @@
+{
+  "samples": 81,
+  "repeat": 1,
+  "candidate_parameters": {
+    "sigma_threshold": 0.01,
+    "gain": 0.05,
+    "base_damping": 0.001,
+    "max_damping": 0.2
+  },
+  "runs": [
+    {
+      "scenario": "heldout_cross_straight",
+      "method": "current_dls",
+      "repeat": 1,
+      "samples": 81,
+      "success_rate": 1.0,
+      "max_endpoint_error_m": 9.993005904090321e-07,
+      "p95_endpoint_error_m": 9.281410786254121e-07,
+      "p95_solve_time_ms": 0.17810000281315297,
+      "max_joint_step_rad": 0.0279711628956366,
+      "min_singular_value_on_solution": 0.0004693643418739763
+    },
+    {
+      "scenario": "heldout_cross_straight",
+      "method": "sigma_adaptive_dls",
+      "repeat": 1,
+      "samples": 81,
+      "success_rate": 1.0,
+      "max_endpoint_error_m": 9.835960128809553e-07,
+      "p95_endpoint_error_m": 8.962432090745064e-07,
+      "p95_solve_time_ms": 0.24760000815149397,
+      "max_joint_step_rad": 0.027971157692787192,
+      "min_singular_value_on_solution": 0.0006089820032969988
+    },
+    {
+      "scenario": "heldout_near_straight",
+      "method": "current_dls",
+      "repeat": 1,
+      "samples": 81,
+      "success_rate": 1.0,
+      "max_endpoint_error_m": 5.378241783731578e-07,
+      "p95_endpoint_error_m": 3.263294218338321e-07,
+      "p95_solve_time_ms": 0.11300000187475234,
+      "max_joint_step_rad": 0.004622850172523325,
+      "min_singular_value_on_solution": 0.003917650321399296
+    },
+    {
+      "scenario": "heldout_near_straight",
+      "method": "sigma_adaptive_dls",
+      "repeat": 1,
+      "samples": 81,
+      "success_rate": 1.0,
+      "max_endpoint_error_m": 9.021140149503501e-07,
+      "p95_endpoint_error_m": 5.221698113187679e-07,
+      "p95_solve_time_ms": 0.11959999392274767,
+      "max_joint_step_rad": 0.00462284817046412,
+      "min_singular_value_on_solution": 0.003936841235031229
+    },
+    {
+      "scenario": "heldout_curved",
+      "method": "current_dls",
+      "repeat": 1,
+      "samples": 81,
+      "success_rate": 1.0,
+      "max_endpoint_error_m": 9.931816977831515e-07,
+      "p95_endpoint_error_m": 8.825127146900132e-07,
+      "p95_solve_time_ms": 0.11470000026747584,
+      "max_joint_step_rad": 0.024816746504551717,
+      "min_singular_value_on_solution": 0.08885125102551159
+    },
+    {
+      "scenario": "heldout_curved",
+      "method": "sigma_adaptive_dls",
+      "repeat": 1,
+      "samples": 81,
+      "success_rate": 1.0,
+      "max_endpoint_error_m": 9.869555301126455e-07,
+      "p95_endpoint_error_m": 8.457364232920409e-07,
+      "p95_solve_time_ms": 0.14279999595601112,
+      "max_joint_step_rad": 0.02481674606042127,
+      "min_singular_value_on_solution": 0.0888512613035094
+    }
+  ]
+}

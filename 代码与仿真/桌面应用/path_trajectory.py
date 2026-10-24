@@ -51,10 +51,26 @@ def sample_path_by_arclength(anchors, sample_count=200, samples_per_segment=40, 
         return np.repeat(dense[:1], sample_count, axis=0)
 
     target_distances = np.linspace(0.0, total_length, sample_count)
-    if preserve_anchors:
+    if preserve_anchors and len(points) > 2:
         anchor_indices = np.arange(1, len(points) - 1) * samples_per_segment
         anchor_distances = cumulative[anchor_indices]
-        target_distances = np.unique(np.concatenate((target_distances, anchor_distances)))
+        # 把最近的格点挪到锚点位置，而不是额外插入采样点。
+        # 之前用 np.unique(拼接)，锚点落在格点前方几毫米时会把一个正常区间劈成
+        # 一个很短的区间和一个较长区间；三次样条在这种突变间距上会出现曲率振荡，
+        # 表现为关节加速度在单个采样点附近出现离群尖峰（实测 9.8 rad/s²）。
+        targets = target_distances.copy()
+        used = set()
+        last_index = len(targets) - 1
+        for distance in anchor_distances:
+            index = int(np.argmin(np.abs(target_distances - distance)))
+            index = min(max(index, 1), last_index - 1)
+            while index in used and index < last_index - 1:
+                index += 1
+            if index in used:
+                continue
+            used.add(index)
+            targets[index] = distance
+        target_distances = np.sort(targets)
     sampled = np.column_stack([
         np.interp(target_distances, cumulative, dense[:, axis])
         for axis in range(2)

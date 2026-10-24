@@ -1,0 +1,176 @@
+{
+  "model": {
+    "link_lengths_m": [
+      0.6,
+      0.4
+    ],
+    "samples": 121,
+    "repeats": 3
+  },
+  "candidate_parameters": {
+    "sigma_threshold": 0.02,
+    "gain": 0.05
+  },
+  "aggregate": {
+    "branch_transition_opposite_elbow|current_dls": {
+      "repeats": 3,
+      "mean_success_rate": 1.0,
+      "worst_actual_error_m": 8.433415057225179e-07,
+      "mean_branch_transitions": 0,
+      "unreachable_targets": 0,
+      "unreachable_targets_reported_converged": 0,
+      "reachable_targets_failed": 0,
+      "mean_p95_solve_time_ms": 0.15303333445141712
+    },
+    "branch_transition_opposite_elbow|sigma_adaptive_dls": {
+      "repeats": 3,
+      "mean_success_rate": 1.0,
+      "worst_actual_error_m": 9.967165173297379e-07,
+      "mean_branch_transitions": 0,
+      "unreachable_targets": 0,
+      "unreachable_targets_reported_converged": 0,
+      "reachable_targets_failed": 0,
+      "mean_p95_solve_time_ms": 0.181766665870479
+    },
+    "branch_transition_same_elbow|current_dls": {
+      "repeats": 3,
+      "mean_success_rate": 1.0,
+      "worst_actual_error_m": 8.821125327489274e-07,
+      "mean_branch_transitions": 0,
+      "unreachable_targets": 0,
+      "unreachable_targets_reported_converged": 0,
+      "reachable_targets_failed": 0,
+      "mean_p95_solve_time_ms": 0.12703333292544508
+    },
+    "branch_transition_same_elbow|sigma_adaptive_dls": {
+      "repeats": 3,
+      "mean_success_rate": 1.0,
+      "worst_actual_error_m": 9.716276514124326e-07,
+      "mean_branch_transitions": 0,
+      "unreachable_targets": 0,
+      "unreachable_targets_reported_converged": 0,
+      "reachable_targets_failed": 0,
+      "mean_p95_solve_time_ms": 0.18493332997119674
+    },
+    "mixed_reachability_elbow_negative|current_dls": {
+      "repeats": 3,
+      "mean_success_rate": 0.8512396694214877,
+      "worst_actual_error_m": 0.019999999999999993,
+      "mean_branch_transitions": 1,
+      "unreachable_targets": 54,
+      "unreachable_targets_reported_converged": 0,
+      "reachable_targets_failed": 0,
+      "mean_p95_solve_time_ms": 24.612366665678564
+    },
+    "mixed_reachability_elbow_negative|sigma_adaptive_dls": {
+      "repeats": 3,
+      "mean_success_rate": 0.8512396694214877,
+      "worst_actual_error_m": 0.030606854265570194,
+      "mean_branch_transitions": 2,
+      "unreachable_targets": 54,
+      "unreachable_targets_reported_converged": 0,
+      "reachable_targets_failed": 0,
+      "mean_p95_solve_time_ms": 52.06436666776426
+    },
+    "mixed_reachability_elbow_positive|current_dls": {
+      "repeats": 3,
+      "mean_success_rate": 0.8512396694214877,
+      "worst_actual_error_m": 0.019999999999999987,
+      "mean_branch_transitions": 0,
+      "unreachable_targets": 54,
+      "unreachable_targets_reported_converged": 0,
+      "reachable_targets_failed": 0,
+      "mean_p95_solve_time_ms": 9.520366664219182
+    },
+    "mixed_reachability_elbow_positive|sigma_adaptive_dls": {
+      "repeats": 3,
+      "mean_success_rate": 0.8512396694214877,
+      "worst_actual_error_m": 0.023723836266758537,
+      "mean_branch_transitions": 1,
+      "unreachable_targets": 54,
+      "unreachable_targets_reported_converged": 0,
+      "reachable_targets_failed": 0,
+      "mean_p95_solve_time_ms": 15.495699997700285
+    },
+    "target_noise_0.0mm|current_dls": {
+      "repeats": 3,
+      "mean_success_rate": 1.0,
+      "worst_actual_error_m": 8.47263671138006e-07,
+      "mean_branch_transitions": 0,
+      "unreachable_targets": 0,
+      "unreachable_targets_reported_converged": 0,
+      "reachable_targets_failed": 0,
+      "mean_p95_solve_time_ms": 0.11916666699107736
+    },
+    "target_noise_0.0mm|sigma_adaptive_dls": {
+      "repeats": 3,
+      "mean_success_rate": 1.0,
+      "worst_actual_error_m": 8.472637762357981e-07,
+      "mean_branch_transitions": 0,
+      "unreachable_targets": 0,
+      "unreachable_targets_reported_converged": 0,
+      "reachable_targets_failed": 0,
+      "mean_p95_solve_time_ms": 0.15846666550108543
+    },
+    "target_noise_0.5mm|current_dls": {
+      "repeats": 3,
+      "mean_success_rate": 1.0,
+      "worst_actual_error_m": 8.710350093878813e-07,
+      "mean_branch_transitions": 0,
+      "unreachable_targets": 0,
+      "unreachable_targets_reported_converged": 0,
+      "reachable_targets_failed": 0,
+      "mean_p95_solve_time_ms": 0.11873333278344944
+    },
+    "target_noise_0.5mm|sigma_adaptive_dls": {
+      "repeats": 3,
+      "mean_success_rate": 1.0,
+      "worst_actual_error_m": 8.710284989752221e-07,
+      "mean_branch_transitions": 0,
+      "unreachable_targets": 0,
+      "unreachable_targets_reported_converged": 0,
+      "reachable_targets_failed": 0,
+      "mean_p95_solve_time_ms": 0.1405000002705492
+    },
+    "target_noise_2.0mm|current_dls": {
+      "repeats": 3,
+      "mean_success_rate": 1.0,
+      "worst_actual_error_m": 9.949082177012643e-07,
+      "mean_branch_transitions": 0,
+      "unreachable_targets": 0,
+      "unreachable_targets_reported_converged": 0,
+      "reachable_targets_failed": 0,
+      "mean_p95_solve_time_ms": 0.15163333106708402
+    },
+    "target_noise_2.0mm|sigma_adaptive_dls": {
+      "repeats": 3,
+      "mean_success_rate": 1.0,
+      "worst_actual_error_m": 9.904688174315446e-07,
+      "mean_branch_transitions": 0,
+      "unreachable_targets": 0,
+      "unreachable_targets_reported_converged": 0,
+      "reachable_targets_failed": 0,
+      "mean_p95_solve_time_ms": 0.16536666710938638
+    },
+    "target_noise_5.0mm|current_dls": {
+      "repeats": 3,
+      "mean_success_rate": 0.9944903581267218,
+      "worst_actual_error_m": 0.001041836843130855,
+      "mean_branch_transitions": 0.3333333333333333,
+      "unreachable_targets": 2,
+      "unreachable_targets_reported_converged": 0,
+      "reachable_targets_failed": 0,
+      "mean_p95_solve_time_ms": 0.1833333347652418
+    },
+    "target_noise_5.0mm|sigma_adaptive_dls": {
+      "repeats": 3,
+      "mean_success_rate": 0.9944903581267218,
+      "worst_actual_error_m": 0.0012493498567164826,
+      "mean_branch_transitions": 0.3333333333333333,
+      "unreachable_targets": 2,
+      "unreachable_targets_reported_converged": 0,
+      "reachable_targets_failed": 0,
+      "mean_p95_solve_time_ms": 0.19666666291110838
+    }
+  }
+}

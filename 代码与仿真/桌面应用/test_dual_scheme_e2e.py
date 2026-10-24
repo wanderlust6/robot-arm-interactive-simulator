@@ -76,7 +76,28 @@ class DualSchemeEndToEndTests(unittest.TestCase):
             self.assertTrue(np.all(np.isfinite(playback["joint_angles"])))
             self.assertTrue(np.isfinite(playback["endpoint_error"]))
 
-        self.assertAlmostEqual(progress_values[0], progress_values[1], places=9)
+        # 播放按各方案自身的时间轴推进：每个方案取自身时刻，而不是统一到主方案进度。
+        # 总时长不同的方案会在路径的不同进度上停下（较快的更早到达终点）。
+        for key, result in window._planning_results.items():
+            playback = result.diagnostics["playback"]
+            plan = result.plan
+            times = np.asarray(plan.times, dtype=float)
+            self.assertAlmostEqual(
+                playback["time"],
+                float(np.clip(window._simulation_duration, times[0], times[-1])),
+                places=9,
+            )
+            progress_samples = (
+                np.asarray(plan.time_progress, dtype=float)
+                if plan.time_progress is not None
+                else np.linspace(0.0, 1.0, len(times))
+            )
+            self.assertAlmostEqual(
+                playback["path_progress"],
+                float(np.interp(playback["time"], times, progress_samples)),
+                places=9,
+            )
+        self.assertTrue(all(0.0 <= value <= 1.0 for value in progress_values))
         np.testing.assert_allclose(
             window.workspace._shadow_joint_angles,
             joint_bias.diagnostics["playback"]["joint_angles"],
@@ -129,7 +150,7 @@ class DualSchemeEndToEndTests(unittest.TestCase):
         self.assertEqual(len(rows), len(window._simulation_log_times) + 1)
         self.assertEqual(len(rows[0]), len(window._data_columns))
         self.assertIn("连续性优先", rows[0][1])
-        self.assertIn("冗余关节构型偏置", rows[0][2])
+        self.assertIn("参考构型偏置", rows[0][2])
         self.assertTrue(all(len(row) == len(rows[0]) for row in rows[1:]))
 
     def test_secondary_scheme_failure_preserves_primary_plan_and_reason(self):

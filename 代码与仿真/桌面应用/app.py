@@ -1,14 +1,13 @@
-﻿"""机械臂交互式仿真平台的首个桌面界面原型。"""
+"""机械臂交互式仿真平台的首个桌面界面原型。"""
 
 import csv
 import math
 import sys
-import time
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
-from scipy.interpolate import CubicHermiteSpline, CubicSpline, PchipInterpolator
+from scipy.interpolate import CubicHermiteSpline
 from PySide6.QtCore import QSignalBlocker, Qt, QTimer
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
@@ -60,6 +59,55 @@ from workspace import ArmWorkspace
 from path_trajectory import sample_path_by_arclength, parameterize_path, find_sharp_corner_indices
 from simulation_plot import SimulationPlot, AxisSelectionDialog, VARIABLES, variable_key
 from experiment_io import write_experiment_package, read_experiment_package
+from experiment_panel import AutomaticExperimentDialog
+
+
+# 参与同时比较的路径方案（顺序即界面顺序，第一个勾选的方案作为主机械臂）。
+#
+# 两个方案不在界面中，但保留实现，供离线研究与复现历史报告使用：
+# - 奇异值自适应阻尼 DLS：阻尼只在 σ_min < 阈值时增加，三连杆常规路径上阈值
+#   永不触发，结果与基线逐位相同（实测 4e-8°）。它是"近奇异专用"策略，
+#   不适合与基线并列成年常规选项。
+# - 整段平滑优化：整条关节路径的 SLSQP 联合优化，界面默认 240 采样点下需约
+#   200 s 且二阶差分只降约 9%，放进同步规划会冻结窗口数分钟。
+PATH_SCHEME_ORDER = (
+    "continuous",
+    "joint_bias",
+    "weighted",
+    "joint_limit_avoidance",
+)
+PATH_SCHEME_LABELS = {
+    "continuous": "连续性优先",
+    "joint_bias": "参考构型偏置",
+    "weighted": "加权关节分配",
+    "adaptive_dls": "奇异值自适应阻尼 DLS",
+    "joint_limit_avoidance": "关节限位规避",
+    "pathwise_optimization": "整段平滑优化",
+}
+PATH_SCHEME_COLORS = {
+    "continuous": "#2f8884",
+    "joint_bias": "#e87524",
+    "weighted": "#7c3aed",
+    "adaptive_dls": "#2563eb",
+    "joint_limit_avoidance": "#dc2626",
+    "pathwise_optimization": "#db2777",
+}
+PATH_SCHEME_COLOR_NAMES = {
+    "continuous": "蓝绿",
+    "joint_bias": "橙",
+    "weighted": "紫",
+    "adaptive_dls": "蓝",
+    "joint_limit_avoidance": "红",
+    "pathwise_optimization": "品红",
+}
+PATH_SCHEME_TOOLTIPS = {
+    "continuous": "热启动保持相邻解连续，不做构型优化（基线）。",
+    "joint_bias": "在零空间中向固定参考构型靠拢；需要冗余自由度才能明显改变构型。",
+    "weighted": "加权最小范数求解：权重大的关节更“懒”，冗余转角由其他关节承担。",
+    "adaptive_dls": "按雅可比最小奇异值增大阻尼；只在接近奇异时才会与基线不同。",
+    "joint_limit_avoidance": "在零空间中加入远离限位的排斥梯度；必须先启用关节限位。",
+    "pathwise_optimization": "对整条关节路径做联合优化（SLSQP），降低二阶差分；失败时拒绝输出。",
+}
 
 
 class MainWindow(QMainWindow):
@@ -99,6 +147,13 @@ class MainWindow(QMainWindow):
         self._simulation_log_angles = []
         self._simulation_log_velocities = []
         self._simulation_log_accelerations = []
+        # 每个采样点的角速度/角加速度是否来自规划样条的解析导数。
+        # 没有规划样条时记录的是占位零，不能当作有效导数参与力矩计算。
+        self._simulation_log_analytic_derivatives = []
+        # 各节点速度/加速度的解析值，形状为 (采样数, 节点数, 2)。
+        # 绘图直接使用它们，避免对位置序列做两次数值微分。
+        self._simulation_log_node_velocities = []
+        self._simulation_log_node_accelerations = []
         self._simulation_log_torques = []
         self._simulation_log_min_singular_values = []
         self._simulation_log_condition_numbers = []
@@ -168,6 +223,14 @@ class MainWindow(QMainWindow):
         toolbar.addAction(self.load_experiment_action)
 
         toolbar.addSeparator()
+        self.automatic_experiment_action = QAction("自动实验与算法对比", self)
+        self.automatic_experiment_action.setToolTip(
+            "自动生成工作空间边界工况，配对比较当前 DLS 与奇异值自适应 DLS，并保存批次结果"
+        )
+        self.automatic_experiment_action.triggered.connect(self._open_automatic_experiment)
+        toolbar.addAction(self.automatic_experiment_action)
+
+        toolbar.addSeparator()
 
         self.link_count_control = QSpinBox()
         self.link_count_control.setRange(1, 12)
@@ -181,20 +244,106 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _adaptive_dls_solver(arm, target, initial, limits=None):
+        """Use singular-value-adaptive damping, with bounded-DLS correction if needed."""
         angles, error, converged, _iterations, _peak_damping = adaptive_ik(
-            arm, target, initial,
-            max_iterations=250,
-            tolerance=1e-6,
-            base_damping=1e-3,
-            sigma_threshold=0.05,
-            gain=0.5,
-            max_damping=1.0,
+            arm, target, initial, max_iterations=250, tolerance=1e-6,
+            base_damping=1e-3, sigma_threshold=0.05, gain=0.5, max_damping=1.0,
         )
-        if limits is not None:
-            angles = np.clip(angles, limits.lower, limits.upper)
-            error = float(np.linalg.norm(arm.forward_kinematics(angles)[-1] - target))
-            converged = bool(converged and error <= 1e-6)
+        if limits is not None and not limits.contains(angles):
+            return solve_n_link_ik(arm, target, np.clip(angles, limits.lower, limits.upper), limits=limits)
         return angles, error, converged
+
+    @staticmethod
+    def _joint_limit_avoidance_solver(arm, target, initial, limits=None):
+        """Add a null-space repulsion gradient from joint limits to the DLS task step."""
+        target = np.asarray(target, dtype=float)
+        q = np.asarray(initial, dtype=float).copy()
+        if limits is None:
+            return solve_n_link_ik(arm, target, q)
+        lower, upper = limits.lower, limits.upper
+        if q.shape != (arm.joint_count,) or target.shape != (2,):
+            raise ValueError("Invalid joint-limit-avoidance IK input dimensions")
+        q = np.clip(q, lower, upper)
+        damping = 1e-3
+        best, best_error = q.copy(), float(np.linalg.norm(arm.forward_kinematics(q)[-1] - target))
+        for _ in range(400):
+            error_vector = target - arm.forward_kinematics(q)[-1]
+            error = float(np.linalg.norm(error_vector))
+            if error < best_error:
+                best, best_error = q.copy(), error
+            if error <= 1e-6:
+                return q, error, True
+            jac = arm.jacobian(q)
+            pinv = jac.T @ np.linalg.solve(jac @ jac.T + damping**2 * np.eye(2), np.eye(2))
+            gradient = 1.0 / np.maximum(q - lower, 1e-4) - 1.0 / np.maximum(upper - q, 1e-4)
+            projector = np.eye(arm.joint_count) - pinv @ jac
+            step = pinv @ error_vector + 0.015 * (projector @ gradient)
+            norm = float(np.linalg.norm(step))
+            if norm > 0.15:
+                step *= 0.15 / norm
+            candidate = np.clip(q + step, lower + 1e-7, upper - 1e-7)
+            candidate_error = float(np.linalg.norm(arm.forward_kinematics(candidate)[-1] - target))
+            # 零空间分量只改变关节构型，几乎不改变末端位置；因此允许末端误差有
+            # 1e-7 m 量级的二阶变化。若要求"误差绝不增加"，零空间步会被反复否决，
+            # 结果退化成与基线 DLS 完全相同的关节路径。
+            if candidate_error <= error + 1e-7:
+                q = candidate
+                damping = max(damping * 0.8, 1e-6)
+            else:
+                damping = min(damping * 4.0, 1.0)
+        return best, best_error, best_error <= 1e-6
+
+    @staticmethod
+    def _weighted_joint_solver(arm, target, initial, limits=None, weights=None):
+        """加权阻尼最小二乘：按关节权重分配冗余自由度。
+
+        求解 ``q̇ = W⁻¹Jᵀ(JW⁻¹Jᵀ + λ²I)⁻¹e``，W 为关节权重对角阵。
+        权重越大的关节在冗余分解中越"懒"，末端位置仍由全部关节共同满足，
+        因此同一末端路径会得到不同的关节构型——这正是各方案可以比较的地方。
+
+        默认把第一关节的权重调高，使第一关节运动更少、末段关节承担更多转角。
+        """
+        target = np.asarray(target, dtype=float)
+        q = np.asarray(initial, dtype=float).copy()
+        count = arm.joint_count
+        if target.shape != (2,) or q.shape != (count,):
+            raise ValueError("加权关节分配 IK 的目标或关节角维度无效")
+        if weights is None:
+            weights = np.ones(count, dtype=float)
+            weights[0] = 8.0
+        weights = np.asarray(weights, dtype=float)
+        if weights.shape != (count,) or not np.all(np.isfinite(weights)) or np.any(weights <= 0):
+            raise ValueError("关节权重必须是长度与关节数一致的正数序列")
+        inverse_weights = np.diag(1.0 / weights)
+        lower = np.full(count, -np.inf) if limits is None else limits.lower
+        upper = np.full(count, np.inf) if limits is None else limits.upper
+        q = np.clip(q, lower, upper)
+        damping = 1e-3
+        best, best_error = q.copy(), float(np.linalg.norm(arm.forward_kinematics(q)[-1] - target))
+        for _ in range(400):
+            error_vector = target - arm.forward_kinematics(q)[-1]
+            error = float(np.linalg.norm(error_vector))
+            if error < best_error:
+                best, best_error = q.copy(), error
+            if error <= 1e-6:
+                return q, error, True
+            jac = arm.jacobian(q)
+            weighted_jjt = jac @ inverse_weights @ jac.T
+            step = inverse_weights @ jac.T @ np.linalg.solve(
+                weighted_jjt + damping**2 * np.eye(2), error_vector
+            )
+            norm = float(np.linalg.norm(step))
+            if norm > 0.15:
+                step *= 0.15 / norm
+            candidate = np.clip(q + step, lower, upper)
+            candidate_error = float(np.linalg.norm(arm.forward_kinematics(candidate)[-1] - target))
+            if candidate_error <= error + 1e-7:
+                q = candidate
+                damping = max(damping * 0.8, 1e-6)
+            else:
+                damping = min(damping * 4.0, 1.0)
+        error = float(np.linalg.norm(arm.forward_kinematics(q)[-1] - target))
+        return q, error, error <= 1e-6
 
     def _keep_one_path_scheme(self, key, checked):
         if not checked and not any(control.isChecked() for control in self.motion_path_checks.values()):
@@ -206,8 +355,19 @@ class MainWindow(QMainWindow):
         self._refresh_workspace()
 
     @staticmethod
-    def _joint_bias_path_solver(arm, target, initial, limits=None, reference_angles=None):
-        """用固定参考构型的零空间偏好求解，避免每个路径点累积关节偏移。"""
+    def _joint_bias_path_solver(
+        arm, target, initial, limits=None, reference_angles=None,
+        bias_weight=0.05, bias_iterations=2,
+    ):
+        """用固定参考构型的零空间偏好求解。
+
+        偏置只在每个路径点的前 ``bias_iterations`` 次迭代施加，之后只做任务收敛。
+        若让偏置一直作用到收敛，求解器单点就会在零空间里直接漂到参考构型：
+        实测相邻路径点的关节跳变可达 0.186 rad（约 10.7°），时间标定后角加速度
+        峰值被放大到 5.6 rad/s²，曲线上就是剧烈抖动。限制成前几次迭代后，
+        构型沿整条路径逐点靠拢：相邻步长降到 0.023 rad，而与基线的最大关节差
+        基本不变（17.8° → 17.35°），因为差异是靠整条路径累积出来的。
+        """
         target = np.asarray(target, dtype=float)
         angles = np.asarray(initial, dtype=float).copy()
         reference = angles.copy() if reference_angles is None else np.asarray(reference_angles, dtype=float).copy()
@@ -217,7 +377,7 @@ class MainWindow(QMainWindow):
             angles = np.clip(angles, limits.lower, limits.upper)
             reference = np.clip(reference, limits.lower, limits.upper)
         damping = 1e-3
-        for _ in range(350):
+        for iteration in range(350):
             endpoint = arm.forward_kinematics(angles)[-1]
             error = target - endpoint
             error_norm = float(np.linalg.norm(error))
@@ -228,7 +388,11 @@ class MainWindow(QMainWindow):
             jacobian_pinv = jacobian.T @ np.linalg.solve(regularized, np.eye(2))
             task_step = jacobian_pinv @ error
             null_projector = np.eye(arm.joint_count) - jacobian_pinv @ jacobian
-            bias_step = 0.08 * (null_projector @ (reference - angles))
+            bias_step = (
+                bias_weight * (null_projector @ (reference - angles))
+                if iteration < bias_iterations
+                else 0.0
+            )
             step = task_step + bias_step
             step_norm = float(np.linalg.norm(step))
             if step_norm > 0.15:
@@ -237,7 +401,9 @@ class MainWindow(QMainWindow):
             if limits is not None:
                 candidate = np.clip(candidate, limits.lower, limits.upper)
             candidate_error = float(np.linalg.norm(arm.forward_kinematics(candidate)[-1] - target))
-            if candidate_error <= error_norm:
+            # 偏置项只作用在零空间，允许末端误差出现 1e-7 m 量级的二阶变化；
+            # 否则偏置步会被否决，方案退化成基线 DLS，且容易停在 1e-6 附近不再收敛。
+            if candidate_error <= error_norm + 1e-7:
                 angles = candidate
                 damping = max(damping * 0.8, 1e-6)
             else:
@@ -278,21 +444,36 @@ class MainWindow(QMainWindow):
             "playback": {},
         }
 
+    @staticmethod
+    def _plan_progress_samples(plan):
+        """返回与 plan.times 等长的路径进度序列（0..1）。"""
+        times = np.asarray(plan.times, dtype=float)
+        progress = getattr(plan, "time_progress", None)
+        if progress is None or len(progress) != len(times):
+            progress = np.linspace(0.0, 1.0, len(times))
+        return np.asarray(progress, dtype=float)
+
     def _update_scheme_playback(self, simulation_time):
-        """?????????????????????????????????"""
+        """按各方案**自身的规划时间**取状态，播放时保持各自的时间尺度。
+
+        各方案总时长不同，因此同一时刻它们处在路径的不同进度上：较快的方案更早
+        到达终点并停在那里。这正是"总时间不同"应有的可见结果。
+
+        注意：若需要比较"同一末端目标点下的关节构型"，应使用规划结果中给出的
+        "与主方案最大关节差"，该指标在统一的路径采样网格上计算，不受播放时序影响。
+        """
         for key, result in self._planning_results.items():
             if not result.success or result.spline is None:
                 continue
             plan = result.plan
-            # ?????????????????????????????????
-            scheme_time = float(np.clip(simulation_time, float(plan.times[0]), float(plan.times[-1])))
+            times = np.asarray(plan.times, dtype=float)
+            scheme_time = float(np.clip(simulation_time, float(times[0]), float(times[-1])))
             angles = np.asarray(result.spline(scheme_time), dtype=float)
             velocities = np.asarray(result.spline(scheme_time, 1), dtype=float)
             accelerations = np.asarray(result.spline(scheme_time, 2), dtype=float)
-            progress_samples = plan.time_progress
-            if progress_samples is None or len(progress_samples) != len(plan.times):
-                progress_samples = np.linspace(0.0, 1.0, len(plan.times))
-            scheme_progress = float(np.interp(scheme_time, plan.times, progress_samples))
+            scheme_progress = float(
+                np.interp(scheme_time, times, self._plan_progress_samples(plan))
+            )
             endpoint = self.arm.forward_kinematics(angles)[-1]
             reference_point = endpoint
             if self._planned_cartesian_path is not None:
@@ -318,6 +499,103 @@ class MainWindow(QMainWindow):
                 "min_singular_value": float(metrics["min_singular_value"]),
                 "condition_number": float(metrics["condition_number"]),
             }
+
+    def _scheme_solver_map(self):
+        """返回 {方案键: 求解器}，供规划与"姿态跟随预览"共用同一套口径。"""
+        reference = getattr(self, "_scheme_bias_reference", None)
+        if reference is None:
+            reference = np.asarray(self.joint_angles, dtype=float).copy()
+            if reference.size >= 3:
+                reference[-1] += np.radians(18.0)
+            if self._joint_limits_enabled():
+                reference = np.clip(reference, self.joint_limits.lower, self.joint_limits.upper)
+        return {
+            "continuous": solve_n_link_ik,
+            "joint_bias": lambda arm, target, initial, limits=None: self._joint_bias_path_solver(
+                arm, target, initial, limits=limits, reference_angles=reference
+            ),
+            "weighted": self._weighted_joint_solver,
+            "joint_limit_avoidance": self._joint_limit_avoidance_solver,
+        }
+
+    def _solve_scheme_preview(self, key, solvers=None):
+        """按**当前**末端目标为单个方案求一组关节构型，用于姿态调整时的跟随。
+
+        返回 (angles, status)；求解失败返回 (None, "conflict")。这只是单点试算，
+        不代表该方案已规划好的整条轨迹。
+        """
+        if key == "joint_limit_avoidance" and not self._joint_limits_enabled():
+            return None, "not_applicable"
+        solvers = self._scheme_solver_map() if solvers is None else solvers
+        solver = solvers.get(key)
+        if solver is None:
+            return None, "conflict"
+        try:
+            solution, error, converged = solver(
+                self.arm,
+                np.asarray(self.target, dtype=float),
+                self.joint_angles,
+                self._effective_joint_limits(),
+            )[:3]
+        except (ValueError, RuntimeError):
+            return None, "conflict"
+        angles = np.asarray(solution, dtype=float)
+        if (
+            not converged
+            or float(error) > 1e-5
+            or angles.shape != (self.arm.joint_count,)
+            or not np.all(np.isfinite(angles))
+        ):
+            return None, "conflict"
+        return angles, "preview"
+
+    def _refresh_scheme_arms(self):
+        """把主方案以外的所有已选方案整理成工作区叠加层。
+
+        规划仍然有效（已准备或正在播放）时，使用各方案规划轨迹的当前帧；
+        规划因用户调整姿态而作废时，改为按当前末端目标重新求解各方案，
+        使叠加臂跟随用户的调整，而不是停在旧姿态上。
+        """
+        arms = []
+        primary_key = getattr(self, "_primary_scheme_key", None)
+        primary = self._planning_results.get(primary_key)
+        if primary is not None:
+            arms.append({
+                "key": primary_key,
+                "label": primary.label,
+                "color": PATH_SCHEME_COLORS.get(primary_key, "#2f8884"),
+                "angles": None,
+                "status": "primary",
+                "role": "primary",
+            })
+        playback_valid = bool(self._simulation_prepared) or self._simulation_timer.isActive()
+        solvers = None if playback_valid else self._scheme_solver_map()
+        for key, result in self._planning_results.items():
+            if key == primary_key:
+                continue
+            if result.status == "not_applicable":
+                angles, status = None, "not_applicable"
+            elif not result.success:
+                angles, status = None, "failed"
+            elif playback_valid:
+                angles = result.diagnostics.get("playback", {}).get("joint_angles")
+                if angles is None:
+                    angles, status = None, "pending"
+                else:
+                    angles = np.asarray(angles, dtype=float)
+                    # 差异小于 0.01° 视为与主方案一致，在图例中说明，避免误认为绘图错误。
+                    diff = result.diagnostics.get("max_joint_diff_deg")
+                    status = "identical" if diff is not None and diff < 0.01 else "ready"
+            else:
+                angles, status = self._solve_scheme_preview(key, solvers)
+            arms.append({
+                "key": key,
+                "label": result.label,
+                "color": PATH_SCHEME_COLORS.get(key, "#6b7280"),
+                "angles": None if angles is None else np.asarray(angles, dtype=float),
+                "status": status,
+            })
+        self.workspace.set_scheme_arms(arms)
 
     def _prepare_simulation(self):
         self._simulation_timer.stop()
@@ -371,17 +649,27 @@ class MainWindow(QMainWindow):
             selected_keys = [key for key, control in self.motion_path_checks.items() if control.isChecked()]
             if not selected_keys:
                 raise ValueError("至少选择一种路径方案。")
+            # 适用性检查：未启用关节限位时，"限位规避"与基线在数学上完全等价，
+            # 必须明确标为不适用，而不是静默产出一条与基线重合的曲线。
+            not_applicable = {
+                key: "未启用关节限位：限位规避与基线完全等价，不参与本批次比较。"
+                for key in selected_keys
+                if key == "joint_limit_avoidance" and not self._joint_limits_enabled()
+            }
+            plan_keys = [key for key in selected_keys if key not in not_applicable]
+            if not plan_keys:
+                raise ValueError("所选方案在当前设置下都不适用：" + "；".join(not_applicable.values()))
+            primary_key = plan_keys[0]
+            self._primary_scheme_key = primary_key
             bias_reference = start_angles.copy()
             if bias_reference.size >= 3:
                 bias_reference[-1] += np.radians(18.0)
             if self._joint_limits_enabled():
                 bias_reference = np.clip(bias_reference, self.joint_limits.lower, self.joint_limits.upper)
-            if selected_keys[0] == "joint_bias":
-                selected_solver = lambda arm, target, initial, limits=None: self._joint_bias_path_solver(
-                    arm, target, initial, limits=limits, reference_angles=bias_reference
-                )
-            else:
-                selected_solver = solve_n_link_ik
+            # 记录参考构型，使规划与后续"姿态跟随预览"使用同一个偏置目标。
+            self._scheme_bias_reference = bias_reference
+            solver_map = self._scheme_solver_map()
+            selected_solver = solver_map[primary_key]
             comparison_plans = {}
             if algorithm == "compare":
                 for method_name, solver in (
@@ -469,13 +757,17 @@ class MainWindow(QMainWindow):
                     max_end_effector_speed=(self.max_end_effector_speed_control.value() if self.end_effector_speed_limit_enabled.isChecked() else float("inf")),
                     max_joint_jerk=(self.max_joint_jerk_control.value() if self.jerk_limit_enabled.isChecked() else float("inf")),
                     ik_solver=selected_solver,
+                    pathwise_optimization=(primary_key == "pathwise_optimization"),
                     )
             if algorithm != "compare":
                 self.algorithm_comparison_label.setText(
-                    "已选路径方案：" + "、".join("连续性优先" if key == "continuous" else "冗余关节构型偏置" for key in selected_keys) + "；末端任务轨迹与初始姿态保持固定。"
+                    "已选路径方案：" + "、".join(
+                        PATH_SCHEME_LABELS[key] + ("（不适用）" if key in not_applicable else "")
+                        for key in selected_keys
+                    )
+                    + "；各方案共用同一条末端路径与同一初始姿态，只改变关节构型分配。"
                 )
-            primary_key = selected_keys[0]
-            primary_label = "连续性优先" if primary_key == "continuous" else "冗余关节构型偏置"
+            primary_label = PATH_SCHEME_LABELS[primary_key]
             self._planning_results[primary_key] = PlanningSchemeResult.from_plan(
                 primary_key, primary_label, plan, self._scheme_diagnostics(plan) if plan.success else {}
             )
@@ -486,14 +778,14 @@ class MainWindow(QMainWindow):
             self._shadow_plan_times = None
             self._shadow_path_progress = None
             self._shadow_plan_status = "disabled"
-            other_keys = [key for key in selected_keys if key != selected_keys[0]]
-            if other_keys:
-                if other_keys[0] == "joint_bias":
-                    other_solver = lambda arm, target, initial, limits=None: self._joint_bias_path_solver(
-                        arm, target, initial, limits=limits, reference_angles=bias_reference
-                    )
-                else:
-                    other_solver = solve_n_link_ik
+            for key, reason in not_applicable.items():
+                self._planning_results[key] = PlanningSchemeResult(
+                    key, PATH_SCHEME_LABELS.get(key, key), "not_applicable", message=reason
+                )
+            other_keys = [key for key in plan_keys if key != primary_key]
+            for other_key in other_keys:
+                other_solver = solver_map[other_key]
+                other_label = PATH_SCHEME_LABELS.get(other_key, other_key)
                 try:
                     other_plan = plan_cartesian_path(
                         model, sampled, start_angles,
@@ -508,31 +800,52 @@ class MainWindow(QMainWindow):
                         max_end_effector_speed=(self.max_end_effector_speed_control.value() if self.end_effector_speed_limit_enabled.isChecked() else float("inf")),
                         max_joint_jerk=(self.max_joint_jerk_control.value() if self.jerk_limit_enabled.isChecked() else float("inf")),
                         ik_solver=other_solver,
+                        # 整段优化是一个开关，不是求解器；遗漏它会让该方案退化成普通 IK，
+                        # 从而与基线逐位相同（此前只在主方案位置生效，属实际缺陷）。
+                        pathwise_optimization=(other_key == "pathwise_optimization"),
                     )
-                    other_key = other_keys[0]
-                    other_label = "连续性优先" if other_key == "continuous" else "冗余关节构型偏置"
                     self._planning_results[other_key] = PlanningSchemeResult.from_plan(
                         other_key, other_label, other_plan,
                         self._scheme_diagnostics(other_plan) if other_plan.success else {},
                     )
-                    if other_plan.success:
-                        self._shadow_joint_angles = np.asarray(other_plan.joint_angles, dtype=float).copy()
-                        self._shadow_plan_times = np.asarray(other_plan.times, dtype=float).copy()
-                        self._shadow_path_progress = np.asarray(other_plan.time_progress, dtype=float).copy()
-                        self._shadow_path_spline = self._planning_results[other_key].spline
-                        self._shadow_plan_status = "ready"
-                    else:
-                        self._shadow_plan_status = "failed"
+                    if other_key == other_keys[0]:
+                        if other_plan.success:
+                            self._shadow_joint_angles = np.asarray(other_plan.joint_angles, dtype=float).copy()
+                            self._shadow_plan_times = np.asarray(other_plan.times, dtype=float).copy()
+                            self._shadow_path_progress = np.asarray(other_plan.time_progress, dtype=float).copy()
+                            self._shadow_path_spline = self._planning_results[other_key].spline
+                            self._shadow_plan_status = "ready"
+                        else:
+                            self._shadow_plan_status = "failed"
                 except (ValueError, RuntimeError) as other_error:
-                    other_key = other_keys[0]
-                    other_label = "连续性优先" if other_key == "continuous" else "冗余关节构型偏置"
                     self._planning_results[other_key] = PlanningSchemeResult.failed(
                         other_key, other_label, other_error
                     )
-                    self._shadow_plan_status = "failed"
+                    if other_key == other_keys[0]:
+                        self._shadow_plan_status = "failed"
                     self.algorithm_comparison_label.setText(
-                        self.algorithm_comparison_label.text() + "\n橙色方案规划失败：" + str(other_error)
+                        self.algorithm_comparison_label.text() + "\n" + other_label + "方案规划失败：" + str(other_error)
                     )
+
+            # 量化每个方案相对主方案的关节路径差异，让"看起来一样"变成可核对的数字。
+            primary_path = (
+                np.asarray(plan.path_joint_angles, dtype=float)
+                if plan.path_joint_angles is not None
+                else None
+            )
+            if primary_path is not None:
+                for key, result in self._planning_results.items():
+                    if key == primary_key or not result.success or result.plan is None:
+                        continue
+                    other_path = getattr(result.plan, "path_joint_angles", None)
+                    if other_path is None:
+                        continue
+                    other_path = np.asarray(other_path, dtype=float)
+                    if other_path.shape != primary_path.shape:
+                        continue
+                    delta = np.degrees(np.abs(other_path - primary_path))
+                    result.diagnostics["max_joint_diff_deg"] = float(np.max(delta))
+                    result.diagnostics["rms_joint_diff_deg"] = float(np.sqrt(np.mean(delta ** 2)))
 
             times = plan.times
             self._planned_joint_angles = plan.joint_angles
@@ -546,6 +859,8 @@ class MainWindow(QMainWindow):
                 int(index): np.asarray(angles, dtype=float).copy()
                 for index, angles in pose_constraints.items()
             }
+            # 记录本次规划识别到的拐点索引，供数据列诊断标注尖峰是否落在拐点附近。
+            self._last_corner_indices = tuple(int(index) for index in corner_indices)
             if self._shadow_plan_status == "ready" and self._shadow_joint_angles is not None:
                 self.workspace.set_shadow_state(self._shadow_joint_angles[0], "ready")
             elif self._shadow_plan_status == "failed":
@@ -569,21 +884,25 @@ class MainWindow(QMainWindow):
             self.constraint_result_label.setText(f"规划失败：{exc}")
             self._set_status(str(exc), "invalid")
             return
-        summary_lines = ["路径规划结果:"]
+        summary_lines = ["路径规划结果（各方案共用同一条末端路径）："]
         for result in self._planning_results.values():
             if result.success and result.plan is not None:
                 scheme_plan = result.plan
+                diff = result.diagnostics.get("max_joint_diff_deg")
+                diff_text = "（主方案）" if diff is None else f"; 与主方案最大关节差 {diff:.1f}°"
                 summary_lines.append(
                     f"{result.label}: 规划成功; 总时间 {float(scheme_plan.duration):.2f} s; "
-                    f"尖角停速点 {len(corner_indices)}; 迭代 {int(scheme_plan.iterations)} 次"
+                    f"尖角停速点 {len(corner_indices)}; 迭代 {int(scheme_plan.iterations)} 次{diff_text}"
                 )
+            elif result.status == "not_applicable":
+                summary_lines.append(f"{result.label}: 不适用; {result.message}")
             else:
                 summary_lines.append(f"{result.label}: 规划失败; {result.message}")
-        summary_lines.append("各方案共用目标路径, 分别计算诊断数据.")
+        summary_lines.append("各方案分别计算关节构型与诊断数据；主方案之外的方案以彩色半透明机械臂叠加显示。")
         self.constraint_result_label.setText("\n".join(summary_lines))
         self._simulation_times = times
         self._simulation_points = points
-        # ???????????????????????????????????????
+        # 播放总时长取所有成功方案的最大值，保证每个方案都能播放到最后一帧。
         successful_durations = [
             float(result.plan.duration)
             for result in self._planning_results.values()
@@ -607,9 +926,13 @@ class MainWindow(QMainWindow):
             self.arm.link_lengths, self.joint_angles, self.target, self.target_status, self.fixed_nodes
         )
         self._simulation_prepared = True
+        # 方案集合可能已变化，先把图表里失效的方案键收敛到当前方案，
+        # 否则图例会显示一个并不存在的方案名。
+        self._sync_plot_scheme_keys()
         self._clear_simulation_log()
         # 准备完成时就为每个成功方案计算起始时刻诊断，运行前也能分别显示各方案。
         self._update_scheme_playback(0.0)
+        self._refresh_scheme_arms()
         self._record_simulation_state(0.0)
         self.select_path_points_button.setChecked(False)
         self.simulation_run_button.setEnabled(True)
@@ -773,8 +1096,8 @@ class MainWindow(QMainWindow):
         return directed_anchors
 
     def _start_simulation(self):
-        # ?????????????????????????????????????
-        # ??????????????????????????????
+        # 每次运行前重新准备：同步起点姿态、关节约束与各方案规划结果。
+        # 准备失败时 _simulation_prepared 保持 False，直接返回，不进入播放。
         self._prepare_simulation()
         if not getattr(self, "_simulation_prepared", False):
             return
@@ -784,7 +1107,6 @@ class MainWindow(QMainWindow):
         self.fixed_nodes.pop(self.arm.joint_count, None)
         self._refresh_workspace()
         self._simulation_time = 0.0
-        self._last_playback_wall_time = time.perf_counter()
         self._clear_simulation_log()
         start = self._simulation_points[0]
         if self._planned_joint_angles is not None:
@@ -819,7 +1141,6 @@ class MainWindow(QMainWindow):
             self.simulation_pause_button.setText("继续")
             self._set_status(f"仿真已暂停：t = {self._simulation_time:.2f} s。", "valid")
         elif len(self._simulation_times) and self._simulation_time < self._simulation_duration:
-            self._last_playback_wall_time = time.perf_counter()
             self._simulation_timer.start()
             self.simulation_pause_button.setText("暂停")
             self._set_status(f"轨迹仿真继续：t = {self._simulation_time:.2f} s。", "valid")
@@ -853,6 +1174,13 @@ class MainWindow(QMainWindow):
         self._simulation_log_angles = []
         self._simulation_log_velocities = []
         self._simulation_log_accelerations = []
+        # 每个采样点的角速度/角加速度是否来自规划样条的解析导数。
+        # 没有规划样条时记录的是占位零，不能当作有效导数参与力矩计算。
+        self._simulation_log_analytic_derivatives = []
+        # 各节点速度/加速度的解析值，形状为 (采样数, 节点数, 2)。
+        # 绘图直接使用它们，避免对位置序列做两次数值微分。
+        self._simulation_log_node_velocities = []
+        self._simulation_log_node_accelerations = []
         self._simulation_log_torques = []
         self._simulation_log_min_singular_values = []
         self._simulation_log_condition_numbers = []
@@ -861,7 +1189,10 @@ class MainWindow(QMainWindow):
             key: {"endpoint_errors": [], "min_singular_values": [], "condition_numbers": []}
             for key in self._planning_results
         }
-        self._simulation_log_scheme_states = {key: {"positions": [], "angles": []} for key in self._planning_results}
+        self._simulation_log_scheme_states = {
+            key: {"positions": [], "angles": [], "velocities": [], "accelerations": []}
+            for key in self._planning_results
+        }
         self._refresh_simulation_plot()
         if hasattr(self, "simulation_diagnostics_label"):
             self._refresh_singularity_status()
@@ -909,23 +1240,58 @@ class MainWindow(QMainWindow):
             log["endpoint_errors"].append(float(playback.get("endpoint_error", np.nan)))
             log["min_singular_values"].append(float(playback.get("min_singular_value", np.nan)))
             log["condition_numbers"].append(float(playback.get("condition_number", np.nan)))
-            state_log = self._simulation_log_scheme_states.setdefault(key, {"positions": [], "angles": []})
+            state_log = self._simulation_log_scheme_states.setdefault(
+                key, {"positions": [], "angles": [], "velocities": [], "accelerations": []}
+            )
             angles = playback.get("joint_angles")
             if result.success and angles is not None:
                 angles = np.asarray(angles, dtype=float)
                 state_log["angles"].append(angles.copy())
                 state_log["positions"].append(self.arm.forward_kinematics(angles).copy())
+                # 同时保存该方案样条的解析角速度/角加速度：绘图直接使用它们，
+                # 不再对记录角度做两次数值微分（那样会把墙钟采样抖动放大成加速度噪声）。
+                state_log["velocities"].append(
+                    np.asarray(playback.get("joint_velocities", np.full(self.arm.joint_count, np.nan)), dtype=float)
+                )
+                state_log["accelerations"].append(
+                    np.asarray(playback.get("joint_accelerations", np.full(self.arm.joint_count, np.nan)), dtype=float)
+                )
             else:
                 state_log["angles"].append(np.full(self.arm.joint_count, np.nan))
                 state_log["positions"].append(np.full((self.arm.joint_count+1, 2), np.nan))
+                state_log["velocities"].append(np.full(self.arm.joint_count, np.nan))
+                state_log["accelerations"].append(np.full(self.arm.joint_count, np.nan))
         self._refresh_simulation_diagnostics(sample_time, metrics, endpoint_error)
         if self._planned_path_spline is not None:
-            sample_time = float(time_value)
-            self._simulation_log_velocities.append(np.asarray(self._planned_path_spline(sample_time, 1), dtype=float))
-            self._simulation_log_accelerations.append(np.asarray(self._planned_path_spline(sample_time, 2), dtype=float))
+            # 截断到样条定义域：播放总时长取各方案最大值，可能大于主方案时长；
+            # 越界求值会外插，使角速度/角加速度随超出时间线性增大，
+            # 而末端姿态其实早已停在终点（实测超出 1 s 后加速度从 0 涨到约 3.2）。
+            if len(self._simulation_times):
+                sample_time = float(np.clip(
+                    float(time_value),
+                    float(self._simulation_times[0]),
+                    float(self._simulation_times[-1]),
+                ))
+            else:
+                sample_time = float(time_value)
+            velocities = np.asarray(self._planned_path_spline(sample_time, 1), dtype=float)
+            accelerations = np.asarray(self._planned_path_spline(sample_time, 2), dtype=float)
+            self._simulation_log_velocities.append(velocities)
+            self._simulation_log_accelerations.append(accelerations)
+            self._simulation_log_analytic_derivatives.append(True)
+            self._simulation_log_node_velocities.append(
+                self.arm.node_velocities(self.joint_angles, velocities)
+            )
+            self._simulation_log_node_accelerations.append(
+                self.arm.node_accelerations(self.joint_angles, velocities, accelerations)
+            )
         else:
             self._simulation_log_velocities.append(np.zeros(self.arm.joint_count, dtype=float))
             self._simulation_log_accelerations.append(np.zeros(self.arm.joint_count, dtype=float))
+            self._simulation_log_analytic_derivatives.append(False)
+            empty_nodes = np.zeros((self.arm.joint_count + 1, 2), dtype=float)
+            self._simulation_log_node_velocities.append(empty_nodes)
+            self._simulation_log_node_accelerations.append(empty_nodes.copy())
         self._recalculate_simulation_torques(incremental=True)
         self._refresh_simulation_plot()
         self._refresh_data_table()
@@ -952,9 +1318,7 @@ class MainWindow(QMainWindow):
         )
         if incremental and sample_count > 1 and len(self._simulation_log_torques) == sample_count - 1:
             window_start = max(0, sample_count - 5)
-            window_torques = calculate_trajectory_torques(
-                model, times[window_start:], angles[window_start:]
-            )
+            window_torques = self._torques_for_window(model, window_start, times, sample_count)
             if window_start == 0:
                 self._simulation_log_torques = [row.copy() for row in window_torques]
             else:
@@ -962,8 +1326,38 @@ class MainWindow(QMainWindow):
                 for index in range(max(0, sample_count - 3), sample_count):
                     self._simulation_log_torques[index] = window_torques[index - window_start].copy()
         else:
-            torques = calculate_trajectory_torques(model, times, angles)
+            torques = self._torques_for_window(model, 0, times, sample_count)
             self._simulation_log_torques = [row.copy() for row in torques]
+
+    def _analytical_derivatives_ready(self, sample_count):
+        """已记录的角速度/角加速度是否全部来自规划样条的解析导数。"""
+        expected = (sample_count, self.arm.joint_count)
+        flags = getattr(self, "_simulation_log_analytic_derivatives", [])
+        velocities = np.asarray(self._simulation_log_velocities, dtype=float)
+        accelerations = np.asarray(self._simulation_log_accelerations, dtype=float)
+        return (
+            len(flags) == sample_count
+            and all(flags)
+            and velocities.shape == expected
+            and accelerations.shape == expected
+            and np.all(np.isfinite(accelerations))
+        )
+
+    def _torques_for_window(self, model, start, times, sample_count):
+        """计算 start 之后各采样点的力矩。
+
+        优先使用规划样条的解析角速度/角加速度：对记录角度做两次数值微分会被
+        墙钟采样的时间抖动放大，使力矩出现与加速度同源的高频噪声。
+        """
+        window_angles = np.asarray(self._simulation_log_angles[start:], dtype=float)
+        if self._analytical_derivatives_ready(sample_count):
+            window_velocities = np.asarray(self._simulation_log_velocities[start:], dtype=float)
+            window_accelerations = np.asarray(self._simulation_log_accelerations[start:], dtype=float)
+            return np.asarray([
+                model.inverse_dynamics(q, qd, qdd)
+                for q, qd, qdd in zip(window_angles, window_velocities, window_accelerations)
+            ])
+        return calculate_trajectory_torques(model, times[start:], window_angles)
 
     def _on_dynamics_parameters_changed(self, _value=None):
         self._link_masses = np.asarray(
@@ -1012,10 +1406,12 @@ class MainWindow(QMainWindow):
             self._simulation_log_endpoint_errors,
             self._plot_scheme_series(),
             getattr(self, "_simulation_log_scheme_states", {}),
+            self._simulation_log_node_velocities,
+            self._simulation_log_node_accelerations,
         )
         if self._plot_window is None:
             first = self._plot_configs[0]
-            plot.set_configuration(first["x"], first["ys"], "shared", first.get("x_scheme", "continuous"), first.get("y_schemes"))
+            plot.set_configuration(first["x"], first["ys"], "shared", first.get("x_scheme") or self._default_plot_scheme(), first.get("y_schemes"))
             plot.chart_title = self._chart_title(self._plot_configs[0], 1)
             plot.update()
         else:
@@ -1040,7 +1436,7 @@ class MainWindow(QMainWindow):
                     self._plot_scheme_series(),
                     getattr(self, "_simulation_log_scheme_states", {}),
                 )
-                self._plot_widgets[index].set_configuration(config["x"], config["ys"], "shared", config.get("x_scheme", "continuous"), config.get("y_schemes"))
+                self._plot_widgets[index].set_configuration(config["x"], config["ys"], "shared", config.get("x_scheme") or self._default_plot_scheme(), config.get("y_schemes"))
                 self._plot_widgets[index].chart_title = self._chart_title(config, index + 1)
                 self._plot_widgets[index].update()
             for index in range(len(self._plot_widgets) - 1, len(self._plot_configs) - 1, -1):
@@ -1052,6 +1448,32 @@ class MainWindow(QMainWindow):
             visible_count = len(self._plot_configs)
             content_height = visible_count * chart_height + max(0, visible_count - 1) * chart_spacing
             self._plot_charts_container.setMinimumHeight(content_height)
+        # 新建或复用的绘图控件都要跟随当前的显示平滑设置。
+        self._apply_plot_smoothing()
+
+    def _apply_plot_smoothing(self):
+        """把"仅影响绘图"的平滑设置应用到所有绘图控件。"""
+        if not hasattr(self, "plot_smoothing_enabled"):
+            return
+        enabled = self.plot_smoothing_enabled.isChecked()
+        window = int(self.plot_smoothing_window.value()) if hasattr(self, "plot_smoothing_window") else 11
+        plots = [getattr(self, "simulation_plot", None)]
+        plots.extend(getattr(self, "_plot_widgets", []) or [])
+        for plot in plots:
+            if plot is not None:
+                plot.set_smoothing(enabled, window)
+
+    def _on_plot_smoothing_changed(self, *_args):
+        enabled = self.plot_smoothing_enabled.isChecked()
+        if hasattr(self, "plot_smoothing_window"):
+            self.plot_smoothing_window.setVisible(enabled)
+        self._apply_plot_smoothing()
+        self._refresh_simulation_plot()
+        self.statusBar().showMessage(
+            "已启用显示平滑：只影响绘图，数据表、CSV 导出与可执行性检查仍使用原始值。"
+            if enabled else "已关闭显示平滑。",
+            6000,
+        )
 
     def _chart_title(self, config, chart_index):
         labels = dict(self._plot_variables())
@@ -1145,6 +1567,11 @@ class MainWindow(QMainWindow):
                 "configurations": self._plot_configs,
                 "display_mode": self._plot_display_mode,
                 "data_columns": list(getattr(self, "_data_columns", ["time"])),
+                # 只记录"显示方式"，不参与任何计算；加载后会恢复同样的观感。
+                "display_smoothing": {
+                    "enabled": bool(getattr(self, "plot_smoothing_enabled", None) and self.plot_smoothing_enabled.isChecked()),
+                    "window": int(self.plot_smoothing_window.value()) if hasattr(self, "plot_smoothing_window") else 11,
+                },
             },
             "algorithm": {
                 "planner": "plan_cartesian_path",
@@ -1275,6 +1702,15 @@ class MainWindow(QMainWindow):
             self._plot_configs = plots.get("configurations", [{"x": "time", "ys": ["node_x:1"]}])
             self._plot_display_mode = plots.get("display_mode", "shared")
             self._data_columns = plots.get("data_columns", ["time"])
+            smoothing = plots.get("display_smoothing", {}) if isinstance(plots, dict) else {}
+            if isinstance(smoothing, dict) and hasattr(self, "plot_smoothing_enabled"):
+                window = int(smoothing.get("window", 11) or 11)
+                self.plot_smoothing_window.setValue(max(5, min(101, window)))
+                self.plot_smoothing_enabled.setChecked(bool(smoothing.get("enabled", False)))
+                self.plot_smoothing_window.setVisible(bool(smoothing.get("enabled", False)))
+                self._apply_plot_smoothing()
+            # 实验包可能记录的是旧方案键，收敛到当前可用方案后再刷新界面。
+            self._sync_plot_scheme_keys()
             self._refresh_plot_configuration_labels()
             self._simulation_duration = float(config.get("simulation", {}).get("duration_s", 5.0))
             self.target = np.asarray(model["target_m"], dtype=float)
@@ -1297,6 +1733,18 @@ class MainWindow(QMainWindow):
             self._set_status(f"已加载实验包：{Path(path).parent}。重新运行前请点击“准备”。", "valid")
         except (OSError, ValueError, KeyError, TypeError, IndexError) as exc:
             self._set_status(f"实验包加载失败：{exc}", "invalid")
+
+    def _open_automatic_experiment(self):
+        """打开自动实验对话框：生成工作空间边界工况，配对运行两种 DLS 并显示批次汇总。
+
+        自动实验是独立于当前主机械臂状态的离线批次，不读取当前模型参数；
+        打开前暂停正在播放的仿真，避免嵌套事件循环期间继续推进主机械臂状态。
+        """
+        if self._simulation_timer.isActive():
+            self._simulation_timer.stop()
+            self.simulation_pause_button.setText("继续")
+        dialog = AutomaticExperimentDialog(self)
+        dialog.exec()
 
     def _export_plot_image(self):
         if self._plot_window is None or not self._plot_widgets:
@@ -1345,11 +1793,168 @@ class MainWindow(QMainWindow):
             export_data = QPushButton("导出 CSV")
             export_data.clicked.connect(self._export_data_csv)
             controls.addWidget(export_data)
+            diagnose = QPushButton("诊断当前列")
+            diagnose.setToolTip(
+                "报告当前列的采样间隔与高频抖动指标，用于区分"
+                "“数据本身在抖”和“显示/采样造成的不平滑”"
+            )
+            diagnose.clicked.connect(self._diagnose_current_data_column)
+            controls.addWidget(diagnose)
             controls.addStretch(1)
             layout.addLayout(controls)
             self._data_columns = ["time"]
         self._refresh_data_table()
         self._data_window.show()
+
+    def _diagnose_current_data_column(self, *_args):
+        """对数据窗口当前列输出采样与抖动诊断。
+
+        "看起来在抖"需要可核对的数字：这里报告采样间隔分布，以及该列的
+        二阶差分（锯齿指标）相对于幅值的比例。比例很小说明数据本身平滑，
+        问题在显示或采样；比例大说明数据确实存在高频抖动。
+        """
+        if not hasattr(self, "_data_table"):
+            return
+        columns = list(getattr(self, "_data_columns", []))
+        column_index = self._data_table.currentColumn()
+        if not columns or column_index < 0 or column_index >= len(columns):
+            QMessageBox.information(self, "数据列诊断", "请先在数据表格中选中一列。")
+            return
+        column = columns[column_index]
+        if isinstance(column, tuple):
+            scheme_key, variable = column
+            scheme_key = self._column_scheme_key(scheme_key, variable)
+            column_label = f"{self._scheme_label(scheme_key)} · {dict(self._plot_variables()).get(variable, variable)}"
+        else:
+            scheme_key, variable = self._default_plot_scheme(), column
+            column_label = dict(self._plot_variables()).get(column, column)
+
+        values = np.asarray(self.simulation_plot._values(variable, scheme_key), dtype=float)
+        times = np.asarray(self._simulation_log_times, dtype=float)
+        finite = np.isfinite(values)
+        usable = values[finite]
+        lines = [f"列：{column_label}", f"样本数：{int(len(values))}（有效 {int(np.count_nonzero(finite))}）"]
+
+        if len(times) > 1:
+            dt = np.diff(times)
+            lines.append(
+                f"采样间隔：中位 {np.median(dt) * 1000:.2f} ms，"
+                f"最小 {np.min(dt) * 1000:.2f} ms，最大 {np.max(dt) * 1000:.2f} ms"
+            )
+        kind = variable.partition(":")[0]
+        if kind in ("joint_velocity", "joint_accel", "joint_torque"):
+            state = self.simulation_plot._scheme_states.get(scheme_key, {})
+            stored = state.get("velocities" if kind == "joint_velocity"
+                               else "accelerations") if state else None
+            stored_ok = stored is not None and np.asarray(stored, dtype=float).shape[0] == len(times)
+            analytic = bool(stored_ok and self._analytical_derivatives_ready(len(times)))
+            lines.append(
+                "数据来源：" + ("规划样条解析导数" if analytic else "对角度做数值微分（回退路径）")
+            )
+        elif kind.startswith("node_") and kind not in ("node_x", "node_y"):
+            node_analytic = len(self._simulation_log_node_velocities) == len(times)
+            lines.append(
+                "数据来源："
+                + ("雅可比 × 解析角速度（解析）" if node_analytic else "对位置做数值微分（回退路径）")
+            )
+        else:
+            lines.append("数据来源：仿真过程直接记录")
+
+        if usable.size < 3:
+            lines.append("有效样本不足，无法评估抖动。")
+        else:
+            amplitude = float(np.max(np.abs(usable)))
+            raw_zigzag = np.abs(np.diff(usable, n=2))
+            # 记录点原本按墙钟采样，间隔并不均匀（实测 4–62 ms）。直接对不等间隔
+            # 序列做二阶差分，会把"采样疏密"误判成"数据抖动"——因为平滑函数在
+            # 不等间隔上的二阶差分本身就会很大。这里先重采样到均匀网格再评估。
+            finite_times = times[finite] if finite.size == times.size else None
+            uniform_values = usable
+            resampled = False
+            if finite_times is not None and finite_times.size == usable.size and finite_times.size > 1:
+                span = float(finite_times[-1] - finite_times[0])
+                spacing = np.diff(finite_times)
+                median_dt = float(np.median(spacing)) if spacing.size else 0.0
+                if span > 0 and median_dt > 0:
+                    uniform_count = max(3, int(round(span / median_dt)) + 1)
+                    uniform_times = np.linspace(finite_times[0], finite_times[-1], uniform_count)
+                    uniform_values = np.interp(uniform_times, finite_times, usable)
+                    resampled = True
+            zigzag = np.abs(np.diff(uniform_values, n=2))
+            median_zigzag = float(np.median(zigzag))
+            max_zigzag = float(np.max(zigzag))
+            ratio = median_zigzag / amplitude if amplitude > 0 else 0.0
+            ratio_max = max_zigzag / amplitude if amplitude > 0 else 0.0
+            lines.extend([
+                f"幅值（最大绝对值）：{amplitude:.6g}",
+                f"均匀重采样后二阶差分：中位 {median_zigzag:.3e}，最大 {max_zigzag:.3e}"
+                + ("" if resampled else "（时间轴异常，未重采样）"),
+                f"相对幅值：中位 {ratio * 100:.4f}%，最大 {ratio_max * 100:.4f}%",
+                f"原始采样二阶差分参考：中位 {float(np.median(raw_zigzag)):.3e}，"
+                f"最大 {float(np.max(raw_zigzag)):.3e}",
+            ])
+            if ratio_max <= 0.01:
+                lines.append("判定：数据本身平滑（锯齿 ≤ 幅值 1%）。原始采样的较大值来自间隔不均，不是数据抖动。")
+            elif ratio_max <= 0.05:
+                lines.append("判定：存在轻微高频成分（≤ 幅值 5%），需结合采样间隔判断是否为混叠。")
+            else:
+                lines.append("判定：数据本身有明显高频抖动，属于轨迹/求解问题，不是显示问题。")
+
+            # 定位尖峰：给出最严重的几个时刻，便于判断是否落在拐点/终点/拼接处。
+            interior_times = (
+                np.linspace(finite_times[0], finite_times[-1], uniform_values.size)
+                if resampled else finite_times
+            )
+            if interior_times is not None and interior_times.size == zigzag.size + 2:
+                order = np.argsort(zigzag)[-3:][::-1]
+                corner_indices = tuple(getattr(self, "_last_corner_indices", ()) or ())
+                corner_times = []
+                plan = self._planning_results.get(getattr(self, "_primary_scheme_key", None))
+                if corner_indices and plan is not None and plan.success and plan.plan is not None:
+                    progress = self._plan_progress_samples(plan.plan)
+                    times_grid = np.asarray(plan.plan.times, dtype=float)
+                    for corner_index in corner_indices:
+                        if 0 <= int(corner_index) < progress.size:
+                            corner_times.append(float(np.interp(
+                                float(progress[int(corner_index)]), progress, times_grid
+                            )))
+                details = []
+                for position in order:
+                    peak_time = float(interior_times[int(position) + 1])
+                    note = ""
+                    if corner_times:
+                        nearest = min(corner_times, key=lambda value: abs(value - peak_time))
+                        if abs(nearest - peak_time) < 0.2:
+                            note = f"（距拐点 {abs(nearest - peak_time) * 1000:.0f} ms）"
+                    if self._simulation_times.size and peak_time >= float(self._simulation_times[-1]) - 1e-6:
+                        note = "（位于主方案终点截断处）"
+                    details.append(f"  t={peak_time:.3f} s 锯齿 {float(zigzag[int(position)]):.3e}{note}")
+                lines.append("尖峰位置（前 3 个）：")
+                lines.extend(details)
+                # 直接打印最坏尖峰前后的原始数值，用于区分"数值真的跳"与"指标误判"。
+                worst = int(np.argmax(zigzag))
+                center = worst + 1
+                low = max(0, center - 2)
+                high = min(int(interior_times.size), center + 3)
+                lines.append("尖峰附近原始数值：")
+                for position in range(low, high):
+                    marker = " ←" if position == center else ""
+                    lines.append(
+                        f"  t={float(interior_times[position]):.4f} s  "
+                        f"值={float(uniform_values[position] if resampled else usable[position]):.6g}{marker}"
+                    )
+                if corner_times:
+                    lines.append("拐点时刻：" + "、".join(f"{value:.3f}" for value in corner_times) + " s")
+                plan_info = getattr(self, "_last_corner_indices", None)
+                if len(self._simulation_times) > 1:
+                    plan_dt = np.diff(np.asarray(self._simulation_times, dtype=float))
+                    lines.append(
+                        f"规划时间网格：最小 {np.min(plan_dt) * 1000:.3f} ms，"
+                        f"中位 {np.median(plan_dt) * 1000:.3f} ms，"
+                        f"小于 1 ms 的间隔 {int(np.count_nonzero(plan_dt < 1e-3))} 个"
+                    )
+        QMessageBox.information(self, "数据列诊断", "\n".join(lines))
+        self.statusBar().showMessage("已完成数据列诊断。", 4000)
 
     def _export_data_csv(self):
         if not self._simulation_log_times:
@@ -1367,11 +1972,22 @@ class MainWindow(QMainWindow):
             path += ".csv"
         labels = dict(self._plot_variables())
         columns = list(getattr(self, "_data_columns", ["time"]))
+        default_scheme = self._default_plot_scheme()
         try:
             with open(path, "w", newline="", encoding="utf-8-sig") as file:
                 writer = csv.writer(file)
-                writer.writerow([(("连续性优先 · " if col[0] == "continuous" else "关节偏置 · ") + labels.get(col[1], col[1])) if isinstance(col, tuple) else labels.get(col, col) for col in columns])
-                values_by_column = [self.simulation_plot._values(col[1], col[0]) if isinstance(col, tuple) else self.simulation_plot._values(col, "continuous") for col in columns]
+                writer.writerow([
+                    f"{self._scheme_label(self._column_scheme_key(column[0], column[1]))} · "
+                    f"{labels.get(column[1], column[1])}"
+                    if isinstance(column, tuple) else labels.get(column, column)
+                    for column in columns
+                ])
+                values_by_column = [
+                    self.simulation_plot._values(column[1], column[0])
+                    if isinstance(column, tuple)
+                    else self.simulation_plot._values(column, default_scheme)
+                    for column in columns
+                ]
                 row_count = min((len(values) for values in values_by_column), default=0)
                 for row in range(row_count):
                     writer.writerow([float(values[row]) for values in values_by_column])
@@ -1385,8 +2001,7 @@ class MainWindow(QMainWindow):
         dialog.setWindowTitle("添加数据列")
         form = QFormLayout(dialog)
         scheme_combo = QComboBox()
-        scheme_combo.addItem("\u8fde\u7eed\u6027\u4f18\u5148", "continuous")
-        scheme_combo.addItem("\u5173\u8282\u504f\u7f6e", "joint_bias")
+        self._populate_scheme_combo(scheme_combo)
         objects = QComboBox()
         quantities = QComboBox()
         objects.addItem("时间", "time")
@@ -1430,7 +2045,8 @@ class MainWindow(QMainWindow):
         if dialog.exec() == QDialog.DialogCode.Accepted:
             key = quantities.currentData()
             selected_scheme = scheme_combo.currentData()
-            column = (selected_scheme, key) if key else None
+            # 方案诊断变量的所属方案由变量索引决定，这里统一规范化，避免标签与数据错配。
+            column = (self._column_scheme_key(selected_scheme, key), key) if key else None
             if column and column not in self._data_columns:
                 self._data_columns.append(column)
                 self._refresh_data_table()
@@ -1454,19 +2070,86 @@ class MainWindow(QMainWindow):
         for column in columns:
             if isinstance(column, tuple):
                 scheme_key, key = column
-                scheme_label = "连续性优先" if scheme_key == "continuous" else "关节偏置"
-                headers.append(f"{scheme_label} · {labels.get(key, key)}")
+                scheme_key = self._column_scheme_key(scheme_key, key)
+                headers.append(f"{self._scheme_label(scheme_key)} · {labels.get(key, key)}")
             else:
                 headers.append(labels.get(column, column))
         self._data_table.setHorizontalHeaderLabels(headers)
+        default_scheme = self._default_plot_scheme()
         for col, column in enumerate(columns):
-            scheme_key, key = column if isinstance(column, tuple) else ("continuous", column)
+            scheme_key, key = column if isinstance(column, tuple) else (default_scheme, column)
             values = self.simulation_plot._values(key, scheme_key)
             for row in range(min(count, len(values))):
                 value = float(values[row])
                 item = QTableWidgetItem(f"{value:.8g}" if np.isfinite(value) else "—")
                 item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
                 self._data_table.setItem(row, col, item)
+
+    def _available_schemes(self):
+        """返回当前可用的 (方案键, 显示名)。
+
+        已规划时只列实际成功规划过的方案；否则退回方案定义，供界面对话框使用，
+        避免把方案名写死成固定的两项。
+        """
+        planned = [
+            (key, result.label)
+            for key, result in self._planning_results.items()
+            if result.success
+        ]
+        if planned:
+            return planned
+        if self._planning_results:
+            return [(key, result.label) for key, result in self._planning_results.items()]
+        return [(key, PATH_SCHEME_LABELS[key]) for key in PATH_SCHEME_ORDER]
+
+    def _scheme_label(self, key):
+        """方案键 → 当前显示名；未知键原样返回。"""
+        result = self._planning_results.get(key)
+        if result is not None:
+            return result.label
+        return PATH_SCHEME_LABELS.get(key, key)
+
+    def _populate_scheme_combo(self, combo):
+        """用当前可用方案填充"路径方案"下拉框。"""
+        combo.clear()
+        for key, label in self._available_schemes():
+            combo.addItem(label, key)
+
+    def _default_plot_scheme(self):
+        """非方案专属曲线（如时间、主机械臂节点）使用的方案键。"""
+        primary = getattr(self, "_primary_scheme_key", None)
+        if primary is not None:
+            return primary
+        available = [key for key, _ in self._available_schemes()]
+        return available[0] if available else "continuous"
+
+    def _sync_plot_scheme_keys(self):
+        """把图表配置里失效的方案键收敛到当前可用方案，避免图例与数据不一致。"""
+        available = [key for key, _ in self._available_schemes()]
+        if not available:
+            return
+        fallback = self._default_plot_scheme()
+        if fallback not in available:
+            fallback = available[0]
+        for config in self._plot_configs:
+            if config.get("x_scheme") not in available:
+                config["x_scheme"] = fallback
+            y_schemes = list(config.get("y_schemes") or [])
+            while len(y_schemes) < len(config["ys"]):
+                y_schemes.append(fallback)
+            config["y_schemes"] = [
+                scheme if scheme in available else fallback for scheme in y_schemes
+            ]
+
+    def _column_scheme_key(self, scheme_key, variable_key):
+        """方案诊断类变量的所属方案由变量索引决定，避免列标签与实际数据不一致。"""
+        kind, _, index_text = variable_key.partition(":")
+        if kind.startswith("scheme_"):
+            keys = list(self._planning_results)
+            index = int(index_text or 0)
+            if 0 <= index < len(keys):
+                return keys[index]
+        return scheme_key
 
     def _plot_variables(self):
         variables = [("time", VARIABLES["time"][0])]
@@ -1529,8 +2212,9 @@ class MainWindow(QMainWindow):
         config = self._plot_configs[chart_index]
         group = self._variable_group(config["ys"][0])
         config["ys"].append(config["ys"][0])
-        y_schemes = list(config.get("y_schemes", ["continuous"] * (len(config["ys"]) - 1)))
-        y_schemes.append(y_schemes[0] if y_schemes else "continuous")
+        default_scheme = self._default_plot_scheme()
+        y_schemes = list(config.get("y_schemes") or [default_scheme] * (len(config["ys"]) - 1))
+        y_schemes.append(y_schemes[0] if y_schemes else default_scheme)
         config["y_schemes"] = y_schemes
         series_index = len(config["ys"]) - 1
         self._refresh_plot_configuration_labels()
@@ -1563,10 +2247,13 @@ class MainWindow(QMainWindow):
         dialog.setWindowTitle("设置 X 轴" if axis == "x" else "设置曲线 " + str(series_index + 1) + " 的 Y 轴")
         layout = QFormLayout(dialog)
         scheme_combo = QComboBox()
-        scheme_combo.addItem("\u8fde\u7eed\u6027\u4f18\u5148", "continuous")
-        scheme_combo.addItem("\u5173\u8282\u504f\u7f6e", "joint_bias")
-        scheme_field = "x_scheme" if axis == "x" else "y_schemes"
-        current_scheme = config.get("x_scheme", "continuous") if axis == "x" else (config.get("y_schemes", ["continuous"] * len(config["ys"]))[series_index] if series_index < len(config.get("y_schemes", [])) else "continuous")
+        self._populate_scheme_combo(scheme_combo)
+        default_scheme = self._default_plot_scheme()
+        if axis == "x":
+            current_scheme = config.get("x_scheme", default_scheme)
+        else:
+            y_schemes = config.get("y_schemes") or [default_scheme] * len(config["ys"])
+            current_scheme = y_schemes[series_index] if series_index < len(y_schemes) else default_scheme
         scheme_combo.setCurrentIndex(max(0, scheme_combo.findData(current_scheme)))
         object_combo = QComboBox()
         quantity_combo = QComboBox()
@@ -1658,9 +2345,10 @@ class MainWindow(QMainWindow):
                 config["x_scheme"] = selected_scheme
             else:
                 config["ys"][series_index] = key
-                y_schemes = list(config.get("y_schemes", ["continuous"] * len(config["ys"])))
+                default_scheme = self._default_plot_scheme()
+                y_schemes = list(config.get("y_schemes") or [default_scheme] * len(config["ys"]))
                 while len(y_schemes) < len(config["ys"]):
-                    y_schemes.append("continuous")
+                    y_schemes.append(default_scheme)
                 y_schemes[series_index] = selected_scheme
                 config["y_schemes"] = y_schemes
             self._refresh_plot_configuration_labels()
@@ -1755,9 +2443,18 @@ class MainWindow(QMainWindow):
             self._set_status(message, "invalid")
             return
 
-        edge_order = 2 if sample_count >= 3 else 1
-        velocities = np.gradient(angles, times, axis=0, edge_order=edge_order)
-        accelerations = np.gradient(velocities, times, axis=0, edge_order=edge_order)
+        angle_values = angles
+        velocity_values = np.asarray(self._simulation_log_velocities, dtype=float)
+        acceleration_values = np.asarray(self._simulation_log_accelerations, dtype=float)
+        use_analytic = self._analytical_derivatives_ready(sample_count)
+        if use_analytic:
+            velocities = velocity_values
+            accelerations = acceleration_values
+        else:
+            # 仅在缺少解析导数（例如旧数据）时退回数值微分。
+            edge_order = 2 if sample_count >= 3 else 1
+            velocities = np.gradient(angles, times, axis=0, edge_order=edge_order)
+            accelerations = np.gradient(velocities, times, axis=0, edge_order=edge_order)
         metrics = []
         if self.speed_limit_enabled.isChecked():
             metrics.append(("角速度", np.abs(velocities), float(self.max_joint_speed_control.value()), "rad/s"))
@@ -1797,7 +2494,12 @@ class MainWindow(QMainWindow):
         else:
             lines.insert(1, "结论：所检查的三项指标均未超过设定限值。")
             self._set_status("轨迹可执行性检查：当前设定下未发现超限。", "valid")
-        lines.append("注意：本检查的角速度和角加速度由离散轨迹数值微分估算；绘图中的关节角速度/角加速度优先采用规划样条的解析导数。检查不包含碰撞、摩擦、电机动态或控制误差。可在结果区域内滚动查看完整说明。")
+        lines.append(
+            "注意：本检查优先使用规划样条的解析角速度/角加速度（与曲线一致），"
+            "只有在缺少解析导数时才退回对离散轨迹数值微分；数值微分会被采样时间抖动放大，"
+            "不适合作为加速度判据。检查不包含碰撞、摩擦、电机动态或控制误差。"
+            "可在结果区域内滚动查看完整说明。"
+        )
         self.feasibility_result_label.setText("\n".join(lines))
 
     def _set_playback_speed(self, slider_value):
@@ -1810,18 +2512,16 @@ class MainWindow(QMainWindow):
             self._simulation_timer.stop()
             self._last_playback_wall_time = None
             return
-        now = time.perf_counter()
-        if self._last_playback_wall_time is None:
-            self._last_playback_wall_time = now
-        # 以单调时钟处理真实播放耗时；同时保证每次定时器回调至少推进一个定时器周期，便于系统调度抖动及自动化测试。
-        elapsed_wall_time = max(
-            self._simulation_timer.interval() / 1000.0,
-            now - self._last_playback_wall_time,
-        )
-        self._last_playback_wall_time = now
+        # 固定步长推进，而不是按墙钟实际耗时推进。
+        # 墙钟一旦被 UI 卡顿打断，采样间隔就会在 4–62 ms 之间跳变（实测），
+        # 导致：① 记录点疏密不均，折线顶点忽密忽疏，看起来像"数据在抖"；
+        # ② 任何基于相邻差分的抖动指标都会失真。
+        # 这里按定时器周期 × 播放倍速推进，掉帧时只是播放落后于墙钟，
+        # 数据仍然落在均匀网格上，符合"以 100 Hz 记录"的设计意图。
+        step = (self._simulation_timer.interval() / 1000.0) * self._playback_speed
         self._simulation_time = min(
             self._simulation_duration,
-            self._simulation_time + elapsed_wall_time * self._playback_speed,
+            self._simulation_time + step,
         )
         if self._planned_joint_angles is not None:
             # 规划阶段已生成连续的关节空间轨迹；播放时必须沿用同一轨迹。
@@ -1878,6 +2578,7 @@ class MainWindow(QMainWindow):
             self.workspace.set_shadow_state(None, "failed")
         else:
             self.workspace.set_shadow_state(None, "disabled")
+        self._refresh_scheme_arms()
         if self.target_status == "invalid":
             self._simulation_timer.stop()
             self.simulation_pause_button.setEnabled(False)
@@ -2049,16 +2750,24 @@ class MainWindow(QMainWindow):
         algorithm_layout = QFormLayout(algorithm_group)
         self.motion_path_checks = {}
         path_options = QVBoxLayout()
-        self.motion_path_checks["continuous"] = QCheckBox("连续性优先（蓝绿色）")
-        self.motion_path_checks["continuous"].setChecked(True)
-        self.motion_path_checks["joint_bias"] = QCheckBox("冗余关节构型偏置（橙色）")
-        self.motion_path_checks["joint_bias"].setChecked(False)
-        for key, control in self.motion_path_checks.items():
-            control.setToolTip("可同时勾选多个方案进行对比；至少保留一个方案。")
-            control.toggled.connect(lambda checked, current=key: self._keep_one_path_scheme(current, checked))
+        for key in PATH_SCHEME_ORDER:
+            control = QCheckBox(
+                f"{PATH_SCHEME_LABELS[key]}（{PATH_SCHEME_COLOR_NAMES[key]}色）"
+            )
+            control.setChecked(key == "continuous")
+            control.setToolTip(
+                PATH_SCHEME_TOOLTIPS[key] + "\n可多选同时比较；至少保留一种方案。"
+            )
+            control.toggled.connect(
+                lambda checked, current=key: self._keep_one_path_scheme(current, checked)
+            )
+            self.motion_path_checks[key] = control
             path_options.addWidget(control)
         algorithm_layout.addRow("路径方案（可多选）", path_options)
-        self.algorithm_comparison_label = QLabel("选择路径方案后点击“准备仿真”，将在工作区生成并显示对应路线。")
+        self.algorithm_comparison_label = QLabel(
+            "选择路径方案后点击“准备仿真”。所有方案共用同一条末端路径与同一初始姿态，"
+            "只改变关节构型分配；勾选多个方案时会在工作区叠加显示。"
+        )
         self.algorithm_comparison_label.setWordWrap(True)
         algorithm_layout.addRow(self.algorithm_comparison_label)
         simulation_layout.addWidget(algorithm_group)
@@ -2176,6 +2885,25 @@ class MainWindow(QMainWindow):
         self._plot_config_layout = QVBoxLayout()
         simulation_layout.addLayout(self._plot_config_layout)
         self.simulation_plot = SimulationPlot()
+        smoothing_row = QHBoxLayout()
+        self.plot_smoothing_enabled = QCheckBox("曲线显示平滑（仅影响绘图）")
+        self.plot_smoothing_enabled.setChecked(False)
+        self.plot_smoothing_enabled.setToolTip(
+            "对绘制到图上的曲线做零相位 Savitzky-Golay 平滑，便于观察趋势。\n"
+            "它不改变任何记录值：数据表格、CSV 导出、可执行性检查与诊断都使用原始数据。"
+        )
+        self.plot_smoothing_enabled.toggled.connect(self._on_plot_smoothing_changed)
+        self.plot_smoothing_window = QSpinBox()
+        self.plot_smoothing_window.setRange(5, 101)
+        self.plot_smoothing_window.setSingleStep(2)
+        self.plot_smoothing_window.setValue(11)
+        self.plot_smoothing_window.setToolTip("平滑窗口点数（奇数，越大越平滑，峰形失真也越大）")
+        self.plot_smoothing_window.setVisible(False)
+        self.plot_smoothing_window.valueChanged.connect(self._on_plot_smoothing_changed)
+        smoothing_row.addWidget(self.plot_smoothing_enabled, 1)
+        smoothing_row.addWidget(QLabel("窗口"))
+        smoothing_row.addWidget(self.plot_smoothing_window)
+        simulation_layout.addLayout(smoothing_row)
         self._plot_window = None
         self.plot_summary_label = QLabel()
         self.plot_summary_label.setWordWrap(True)
@@ -2443,7 +3171,7 @@ class MainWindow(QMainWindow):
         )
 
     def _effective_joint_limits(self):
-        """????????????????????????"""
+        """仅在启用关节限位时返回限位对象，否则返回 None。"""
         return self.joint_limits if self._joint_limits_enabled() else None
 
     def _on_limits_changed(self, _value):
@@ -2779,6 +3507,11 @@ class MainWindow(QMainWindow):
             self._shadow_plan_times = None
             self._shadow_path_progress = None
             self._shadow_plan_status = "disabled"
+            self.constraint_result_label.setText(
+                self.constraint_result_label.text()
+                + "\n\n姿态已调整：原规划作废。叠加臂改为按当前末端目标逐点试算并跟随姿态；"
+                "重新点击“准备”可恢复规划轨迹与播放。"
+            )
         self._refresh_joint_popup()
         self.workspace.set_state(
             self.arm.link_lengths,
@@ -2787,10 +3520,11 @@ class MainWindow(QMainWindow):
             self.target_status,
             self.fixed_nodes,
         )
-        if (not self._simulation_timer.isActive() and self._shadow_plan_status != "ready" and hasattr(self, "motion_path_checks") and all(self.motion_path_checks[key].isChecked() for key in ("continuous", "joint_bias"))):
-            self.workspace.set_shadow_state(self.joint_angles, "ready")
-        elif self._shadow_plan_status != "ready":
+        # 未准备时不再画"与主机械臂重合的影子臂"：那会让人误以为两个方案结果相同。
+        # 各方案的实际构型只在真实规划完成后由 _refresh_scheme_arms 提供。
+        if self._shadow_plan_status != "ready":
             self.workspace.set_shadow_state(None, self._shadow_plan_status)
+        self._refresh_scheme_arms()
         self._refresh_singularity_status()
 
     def _refresh_simulation_diagnostics(self, time_value, metrics, endpoint_error):

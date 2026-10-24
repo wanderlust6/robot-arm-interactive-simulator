@@ -1,0 +1,205 @@
+{
+  "schema_version": 1,
+  "created_at": "2026-10-22T12:01:05.761904+00:00",
+  "application": "机械臂交互式仿真平台",
+  "configuration": {
+    "model": {
+      "link_lengths_m": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "joint_angles_rad": [
+        0.0,
+        0.05,
+        0.05
+      ],
+      "target_m": [
+        2.975,
+        0.18
+      ],
+      "fixed_nodes": {},
+      "joint_limits_rad": {
+        "lower": [
+          -3.141592653589793,
+          -3.141592653589793,
+          -3.141592653589793
+        ],
+        "upper": [
+          3.141592653589793,
+          3.141592653589793,
+          3.141592653589793
+        ],
+        "lower_enabled": [
+          false,
+          false,
+          false
+        ],
+        "upper_enabled": [
+          false,
+          false,
+          false
+        ]
+      }
+    },
+    "dynamics": {
+      "link_masses_kg": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "center_of_mass_fractions": [
+        0.5,
+        0.5,
+        0.5
+      ],
+      "link_inertias_kg_m2": [
+        0.08333333333333333,
+        0.08333333333333333,
+        0.08333333333333333
+      ],
+      "payload_mass_kg": 0.0
+    },
+    "constraints": {
+      "max_duration": {
+        "enabled": false,
+        "value_s": 10.0
+      },
+      "joint_speed": {
+        "enabled": false,
+        "value_rad_s": 4.0
+      },
+      "end_effector_speed": {
+        "enabled": false,
+        "value_m_s": 2.0
+      },
+      "joint_acceleration": {
+        "enabled": false,
+        "value_rad_s2": 12.0
+      },
+      "joint_jerk": {
+        "enabled": false,
+        "value_rad_s3": 100.0
+      },
+      "joint_torque": {
+        "enabled": false,
+        "value_nm": 100.0
+      }
+    },
+    "trajectory": {
+      "anchors": [
+        {
+          "point": [
+            2.993754425672992,
+            0.14981258591750649
+          ],
+          "incoming": null,
+          "outgoing": null
+        },
+        {
+          "point": [
+            2.975,
+            0.18
+          ],
+          "incoming": null,
+          "outgoing": null
+        },
+        {
+          "point": [
+            2.94,
+            0.28
+          ],
+          "incoming": null,
+          "outgoing": null
+        },
+        {
+          "point": [
+            2.9,
+            0.38
+          ],
+          "incoming": null,
+          "outgoing": null
+        },
+        {
+          "point": [
+            2.86,
+            0.46
+          ],
+          "incoming": null,
+          "outgoing": null
+        },
+        {
+          "point": [
+            2.9,
+            0.38
+          ],
+          "incoming": null,
+          "outgoing": null
+        },
+        {
+          "point": [
+            2.94,
+            0.28
+          ],
+          "incoming": null,
+          "outgoing": null
+        },
+        {
+          "point": [
+            2.975,
+            0.18
+          ],
+          "incoming": null,
+          "outgoing": null
+        },
+        {
+          "point": [
+            2.993754425672992,
+            0.14981258591750649
+          ],
+          "incoming": null,
+          "outgoing": null
+        }
+      ],
+      "selected_route_indices": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8
+      ]
+    },
+    "plots": {
+      "configurations": [
+        {
+          "x": "time",
+          "ys": [
+            "node_x:3"
+          ]
+        }
+      ],
+      "display_mode": "shared",
+      "data_columns": [
+        "time"
+      ]
+    },
+    "algorithm": {
+      "planner": "plan_cartesian_path",
+      "path_sampling": "sample_path_by_arclength",
+      "minimum_samples_per_anchor_segment": 240,
+      "time_scaling": "quintic",
+      "joint_path_interpolation": "PCHIP, segmented at detected sharp corners",
+      "sharp_corner_angle_tolerance_deg": 1.0,
+      "playback_sampling_target_hz": 100,
+      "max_planning_duration_s": 120.0
+    },
+    "simulation": {
+      "duration_s": 5.0,
+      "recorded_samples": 0
+    }
+  }
+}

@@ -1,0 +1,209 @@
+{
+  "all_runs_passed": true,
+  "cases": [
+    {
+      "case": "bend",
+      "samples": 17,
+      "initial_error": null,
+      "initial": {
+        "max_error_m": 8.155820771729699e-07,
+        "path_length": 1.6246972930376105,
+        "smoothness": 0.01736684657491825,
+        "max_step_rad": 0.15801656316450347,
+        "limit_margin_deg": 76.33673003386367
+      },
+      "runs": [
+        {
+          "weights": [
+            0.3,
+            0.03
+          ],
+          "success": true,
+          "optimizer_success": true,
+          "message": "Optimization terminated successfully",
+          "iterations": 51,
+          "seconds": 0.03683460000320338,
+          "optimized": {
+            "max_error_m": 4.965068306494546e-16,
+            "path_length": 1.5974088793723713,
+            "smoothness": 0.015839261743447394,
+            "max_step_rad": 0.14922140326158023,
+            "limit_margin_deg": 82.76962670335655
+          },
+          "start_fixed": true
+        }
+      ],
+      "passed": true
+    },
+    {
+      "case": "bend",
+      "samples": 41,
+      "initial_error": null,
+      "initial": {
+        "max_error_m": 9.70552069817213e-07,
+        "path_length": 1.6254129482517778,
+        "smoothness": 0.0011702277933230906,
+        "max_step_rad": 0.06392388828326545,
+        "limit_margin_deg": 76.4674679901093
+      },
+      "runs": [
+        {
+          "weights": [
+            0.3,
+            0.03
+          ],
+          "success": true,
+          "optimizer_success": true,
+          "message": "Optimization terminated successfully",
+          "iterations": 96,
+          "seconds": 1.190063200003351,
+          "optimized": {
+            "max_error_m": 1.3645082175276468e-12,
+            "path_length": 1.5972982505571536,
+            "smoothness": 0.001092212409648751,
+            "max_step_rad": 0.06187649368446425,
+            "limit_margin_deg": 81.07569891285237
+          },
+          "start_fixed": true
+        }
+      ],
+      "passed": true
+    },
+    {
+      "case": "near_singular",
+      "samples": 17,
+      "initial_error": null,
+      "initial": {
+        "max_error_m": 5.277557416764547e-07,
+        "path_length": 0.34355309931065436,
+        "smoothness": 0.0006835957775988618,
+        "max_step_rad": 0.028617834592450483,
+        "limit_margin_deg": 137.0
+      },
+      "runs": [
+        {
+          "weights": [
+            0.3,
+            0.03
+          ],
+          "success": true,
+          "optimizer_success": true,
+          "message": "Optimization terminated successfully",
+          "iterations": 71,
+          "seconds": 0.05731930000183638,
+          "optimized": {
+            "max_error_m": 3.4901684467452197e-14,
+            "path_length": 0.3415138100738927,
+            "smoothness": 0.0003858114628638953,
+            "max_step_rad": 0.02774246216445282,
+            "limit_margin_deg": 137.0
+          },
+          "start_fixed": true
+        }
+      ],
+      "passed": true
+    },
+    {
+      "case": "near_singular",
+      "samples": 41,
+      "initial_error": null,
+      "initial": {
+        "max_error_m": 7.595840973084152e-07,
+        "path_length": 0.34151408828839613,
+        "smoothness": 5.030737740203702e-05,
+        "max_step_rad": 0.011355714060279498,
+        "limit_margin_deg": 136.98744818577552
+      },
+      "runs": [
+        {
+          "weights": [
+            0.3,
+            0.03
+          ],
+          "success": true,
+          "optimizer_success": true,
+          "message": "Optimization terminated successfully",
+          "iterations": 106,
+          "seconds": 1.425304500007769,
+          "optimized": {
+            "max_error_m": 7.052750773938814e-12,
+            "path_length": 0.32840020735728426,
+            "smoothness": 3.447934318627646e-05,
+            "max_step_rad": 0.011185607957623751,
+            "limit_margin_deg": 137.0
+          },
+          "start_fixed": true
+        }
+      ],
+      "passed": true
+    },
+    {
+      "case": "tight",
+      "samples": 17,
+      "initial_error": null,
+      "initial": {
+        "max_error_m": 9.747682519963745e-07,
+        "path_length": 0.7138542024406658,
+        "smoothness": 0.003473162753285926,
+        "max_step_rad": 0.06624358727911293,
+        "limit_margin_deg": 13.45672491339771
+      },
+      "runs": [
+        {
+          "weights": [
+            0.3,
+            0.03
+          ],
+          "success": true,
+          "optimizer_success": true,
+          "message": "Optimization terminated successfully",
+          "iterations": 39,
+          "seconds": 0.0661790000012843,
+          "optimized": {
+            "max_error_m": 9.34884614438864e-12,
+            "path_length": 0.7165032966574956,
+            "smoothness": 0.0033400984717764926,
+            "max_step_rad": 0.06486034517692281,
+            "limit_margin_deg": 14.287157745977565
+          },
+          "start_fixed": true
+        }
+      ],
+      "passed": true
+    },
+    {
+      "case": "tight",
+      "samples": 41,
+      "initial_error": null,
+      "initial": {
+        "max_error_m": 4.6885426125158226e-08,
+        "path_length": 0.7185433569395977,
+        "smoothness": 0.000232173584623756,
+        "max_step_rad": 0.027200959026508636,
+        "limit_margin_deg": 13.389688869621136
+      },
+      "runs": [
+        {
+          "weights": [
+            0.3,
+            0.03
+          ],
+          "success": true,
+          "optimizer_success": true,
+          "message": "Optimization terminated successfully",
+          "iterations": 85,
+          "seconds": 1.371797300002072,
+          "optimized": {
+            "max_error_m": 1.116704902764906e-12,
+            "path_length": 0.716736115468606,
+            "smoothness": 0.0002261750829270512,
+            "max_step_rad": 0.026816554543180778,
+            "limit_margin_deg": 14.444331820333275
+          },
+          "start_fixed": true
+        }
+      ],
+      "passed": true
+    }
+  ]
+}

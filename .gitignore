@@ -51,3 +51,7 @@ credentials/
 # Simulation output (keep experiment definitions and selected reproducible results)
 simulation_output/
 results/tmp/
+
+# Local machine metadata and Windows shortcuts
+.dsh-acl-reports/
+*.lnk

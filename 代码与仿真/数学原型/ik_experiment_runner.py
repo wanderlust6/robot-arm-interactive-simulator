@@ -21,14 +21,14 @@ def validate_config(config):
         raise ValueError("实验配置必须是 JSON 对象")
     for key in ("experiment_id", "scenario_id", "robot", "solver"):
         if key not in config:
-            raise ValueError(f"???????: {key}")
+            raise ValueError(f"缺少必需配置项: {key}")
     for key in ("experiment_id", "scenario_id"):
         if not isinstance(config[key], str) or not config[key].strip():
-            raise ValueError(f"{key} ????????")
+            raise ValueError(f"{key} 必须是非空字符串")
     if not isinstance(config["robot"], dict):
-        raise ValueError("robot ??? JSON ??")
+        raise ValueError("robot 必须是 JSON 对象")
     if not isinstance(config["solver"], dict):
-        raise ValueError("solver ??? JSON ??")
+        raise ValueError("solver 必须是 JSON 对象")
     links = config["robot"].get("link_lengths_m")
     if not isinstance(links, list) or not links or any(
         isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v <= 0 for v in links
@@ -69,7 +69,7 @@ def validate_experiment_inputs(config):
     except (TypeError, ValueError) as exc:
         raise ValueError("targets_m and initial_angles_rad must contain numeric values") from exc
     if targets.ndim != 2 or targets.shape[1] != 2 or targets.shape[0] == 0 or not np.all(np.isfinite(targets)):
-        raise ValueError("targets_m must be a non-empty finite N?2 array")
+        raise ValueError("targets_m must be a non-empty finite N×2 array")
     robot = config.get("robot")
     links = robot.get("link_lengths_m") if isinstance(robot, dict) else None
     if not isinstance(links, list):
@@ -195,9 +195,9 @@ def run_paired_sequence(arm, targets, initial_angles, config):
 def write_results(output_dir, config, result):
     output = Path(output_dir)
     if output.exists() and any(output.iterdir()):
-        raise FileExistsError(f"???????????????: {output}")
+        raise FileExistsError(f"拒绝覆盖非空输出目录: {output}")
     if not any(result.get("rows_by_method", {}).get(method) for method in METHODS):
-        raise ValueError("???????????????")
+        raise ValueError("没有可写入的逐点结果")
     config_json = json.dumps(config, ensure_ascii=False, indent=2, allow_nan=False)
     summary = {
         "experiment_id": config["experiment_id"],

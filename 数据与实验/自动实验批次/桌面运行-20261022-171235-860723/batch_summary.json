@@ -1,0 +1,176 @@
+{
+  "schema_version": 1,
+  "experiment_id": "desktop-auto-demo",
+  "scenario_count": 3,
+  "methods": [
+    "current_dls",
+    "sigma_adaptive_dls"
+  ],
+  "scenarios": [
+    {
+      "scenario_id": "workspace-inner_boundary",
+      "scenario_type": "workspace_boundary",
+      "sample_count": 9,
+      "scenario_metadata": {
+        "region": "inner_boundary",
+        "link_lengths_m": [
+          0.6,
+          0.4
+        ],
+        "inner_radius_m": 0.19999999999999996,
+        "outer_radius_m": 1.0,
+        "sample_count": 9,
+        "boundary_offset_m": 0.0001,
+        "seed": 20261022
+      },
+      "methods": {
+        "current_dls": {
+          "method": "current_dls",
+          "sample_count": 9,
+          "successful_points": 9,
+          "unreachable_target_count": 0,
+          "solver_failure_count": 0,
+          "sequence_success": true,
+          "success_rate": 1.0,
+          "first_failure_index": null,
+          "first_failure_code": null,
+          "max_endpoint_error_m": 6.534653827535809e-06,
+          "p95_endpoint_error_m": 6.507945441610023e-06,
+          "max_joint_step_rad": 2.950913045144861,
+          "min_singular_value": 0.006946461090670438,
+          "total_solve_time_ms": 6.955699998798082,
+          "p95_solve_time_ms": 1.2226000002556248,
+          "tolerance_m": 1e-05
+        },
+        "sigma_adaptive_dls": {
+          "method": "sigma_adaptive_dls",
+          "sample_count": 9,
+          "successful_points": 0,
+          "unreachable_target_count": 0,
+          "solver_failure_count": 9,
+          "sequence_success": false,
+          "success_rate": 0.0,
+          "first_failure_index": 0,
+          "first_failure_code": "non_convergence",
+          "max_endpoint_error_m": 1.7405902504891963e-05,
+          "p95_endpoint_error_m": 1.6320810455592878e-05,
+          "max_joint_step_rad": 2.949726727853352,
+          "min_singular_value": 0.007353147142614536,
+          "total_solve_time_ms": 60.655100003714324,
+          "p95_solve_time_ms": 7.613900000797003,
+          "tolerance_m": 1e-05
+        }
+      }
+    },
+    {
+      "scenario_id": "workspace-outer_boundary",
+      "scenario_type": "workspace_boundary",
+      "sample_count": 9,
+      "scenario_metadata": {
+        "region": "outer_boundary",
+        "link_lengths_m": [
+          0.6,
+          0.4
+        ],
+        "inner_radius_m": 0.19999999999999996,
+        "outer_radius_m": 1.0,
+        "sample_count": 9,
+        "boundary_offset_m": 0.0001,
+        "seed": 20261022
+      },
+      "methods": {
+        "current_dls": {
+          "method": "current_dls",
+          "sample_count": 9,
+          "successful_points": 9,
+          "unreachable_target_count": 0,
+          "solver_failure_count": 0,
+          "sequence_success": true,
+          "success_rate": 1.0,
+          "first_failure_index": null,
+          "first_failure_code": null,
+          "max_endpoint_error_m": 6.799200761657568e-06,
+          "p95_endpoint_error_m": 6.356744285485489e-06,
+          "max_joint_step_rad": 6.877841605598942,
+          "min_singular_value": 0.006469920997021959,
+          "total_solve_time_ms": 8.58919999882346,
+          "p95_solve_time_ms": 1.654520000374759,
+          "tolerance_m": 1e-05
+        },
+        "sigma_adaptive_dls": {
+          "method": "sigma_adaptive_dls",
+          "sample_count": 9,
+          "successful_points": 0,
+          "unreachable_target_count": 0,
+          "solver_failure_count": 9,
+          "sequence_success": false,
+          "success_rate": 0.0,
+          "first_failure_index": 0,
+          "first_failure_code": "non_convergence",
+          "max_endpoint_error_m": 3.1036788724319816e-05,
+          "p95_endpoint_error_m": 2.8654320574099473e-05,
+          "max_joint_step_rad": 6.87187137033473,
+          "min_singular_value": 0.007004910223609452,
+          "total_solve_time_ms": 59.35479999970994,
+          "p95_solve_time_ms": 6.911820000095759,
+          "tolerance_m": 1e-05
+        }
+      }
+    },
+    {
+      "scenario_id": "workspace-regular_reachable",
+      "scenario_type": "workspace_boundary",
+      "sample_count": 9,
+      "scenario_metadata": {
+        "region": "regular_reachable",
+        "link_lengths_m": [
+          0.6,
+          0.4
+        ],
+        "inner_radius_m": 0.19999999999999996,
+        "outer_radius_m": 1.0,
+        "sample_count": 9,
+        "boundary_offset_m": 0.0001,
+        "seed": 20261022
+      },
+      "methods": {
+        "current_dls": {
+          "method": "current_dls",
+          "sample_count": 9,
+          "successful_points": 9,
+          "unreachable_target_count": 0,
+          "solver_failure_count": 0,
+          "sequence_success": true,
+          "success_rate": 1.0,
+          "first_failure_index": null,
+          "first_failure_code": null,
+          "max_endpoint_error_m": 3.6253456154806364e-06,
+          "p95_endpoint_error_m": 3.17750585084668e-06,
+          "max_joint_step_rad": 2.950250330240839,
+          "min_singular_value": 0.3632320413242474,
+          "total_solve_time_ms": 4.940099997838843,
+          "p95_solve_time_ms": 1.1057799994887318,
+          "tolerance_m": 1e-05
+        },
+        "sigma_adaptive_dls": {
+          "method": "sigma_adaptive_dls",
+          "sample_count": 9,
+          "successful_points": 9,
+          "unreachable_target_count": 0,
+          "solver_failure_count": 0,
+          "sequence_success": true,
+          "success_rate": 1.0,
+          "first_failure_index": null,
+          "first_failure_code": null,
+          "max_endpoint_error_m": 3.0458958560226392e-06,
+          "p95_endpoint_error_m": 2.8736575119123733e-06,
+          "max_joint_step_rad": 2.950256605958524,
+          "min_singular_value": 0.3632321038009065,
+          "total_solve_time_ms": 6.972599998334772,
+          "p95_solve_time_ms": 1.391239999429672,
+          "tolerance_m": 1e-05
+        }
+      }
+    }
+  ]
+}

@@ -1,10 +1,10 @@
-﻿"""基于五次时间标定的机械臂约束轨迹规划。"""
+"""基于五次时间标定的机械臂约束轨迹规划。"""
 
 from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
-from scipy.interpolate import PchipInterpolator
+from scipy.interpolate import CubicSpline
 
 from dynamics import PlanarArmDynamics
 from inverse_kinematics import solve_two_link_ik
@@ -231,6 +231,7 @@ def plan_cartesian_path(
     max_end_effector_speed=np.inf,
     max_joint_jerk=np.inf,
     ik_solver=None,
+    pathwise_optimization=False,
 ):
     """沿给定笛卡尔路径连续求逆运动学，并自动搜索满足约束的运动时间。
 
@@ -283,6 +284,16 @@ def plan_cartesian_path(
         joint_path.append(angles.copy())
         previous = angles
     joint_path = np.unwrap(np.asarray(joint_path), axis=0)
+    if pathwise_optimization:
+        from pathwise_ik_optimizer import optimize_joint_path
+        optimized = optimize_joint_path(
+            arm, points, joint_path, limits=limits, smoothness_weight=0.3,
+            motion_weight=0.03, max_iterations=600, endpoint_tolerance=2e-6,
+            fixed_start=True, fixed_indices=tuple(normalized_constraints.keys()),
+        )
+        if not optimized["success"]:
+            raise ValueError(f"整段固定路径优化失败：{optimized['message']}；未使用未验证结果。")
+        joint_path = optimized["joint_angles"]
     # 以笛卡尔路径弧长作为统一进度参数，不能用关节角弧长替代几何路径进度。
     # 否则冗余机械臂的关节变化会扭曲路径参数，导致末端在关键节点附近切角。
     cartesian_distances = np.linalg.norm(np.diff(points, axis=0), axis=1)
@@ -316,12 +327,16 @@ def plan_cartesian_path(
     segment_progress = np.asarray([0.0] + [progress[i] for i in corner_indices] + [1.0], dtype=float)
     if np.any(np.diff(segment_progress) <= 1e-12):
         raise ValueError("拐点路径进度必须严格递增")
+    # 关节路径使用 C² 三次样条，而不是 C¹ 的 PCHIP：
+    # PCHIP 的二阶导在每个路径节点都不连续，会让关节角加速度出现 200 多个跳变，
+    # 表现为加速度曲线剧烈抖动（速度仍连续，所以看起来平滑）。拐点处仍由分段
+    # 与五次时间标定强制停速，那里的加速度跳变是"停住再起步"的物理结果，保留。
     path_splines = []
     for p0, p1 in zip(segment_progress[:-1], segment_progress[1:]):
         mask = (progress >= p0 - 1e-12) & (progress <= p1 + 1e-12)
         if np.count_nonzero(mask) < 2:
             raise ValueError("拐点之间的路径采样点不足，无法保持分段轨迹")
-        path_splines.append(PchipInterpolator(progress[mask], joint_path[mask], axis=0))
+        path_splines.append(CubicSpline(progress[mask], joint_path[mask], axis=0))
     last = None
     previous_duration = None
     refining = False
@@ -344,6 +359,10 @@ def plan_cartesian_path(
         # Regular samples and exact path samples can represent the same mathematical
         # time but differ by a few floating-point ulps. np.unique only removes exact
         # duplicates, leaving near-zero dt values that destabilize numerical gradients.
+        #
+        # 注意：不能为了消除"极短区间"而按更大容差合并时刻——每个笛卡尔路径样本
+        # 都必须保留在输出时间轨迹中（见 test_trajectory_planner 的契约测试）。
+        # 实测这些极短区间两端的角加速度本身是一致的，并不会产生曲率尖峰。
         time_tolerance = 64.0 * np.finfo(float).eps * max(1.0, abs(duration))
         merged_times = [float(candidate_times[0])]
         for candidate_time in candidate_times[1:]:

@@ -5,6 +5,66 @@ import numpy as np
 from planar_arm import PlanarArm
 
 
+class TestPlanarArmNodeKinematics(unittest.TestCase):
+    """节点速度/加速度的解析式必须与独立数值参考一致。"""
+
+    def setUp(self):
+        self.arm = PlanarArm([1.0, 0.8, 0.6])
+        self.angles = np.array([0.31, -0.52, 0.73])
+        self.velocities = np.array([0.4, -0.25, 0.15])
+        self.accelerations = np.array([-0.6, 0.35, -0.2])
+
+    def test_endpoint_node_jacobian_matches_end_effector_jacobian(self):
+        np.testing.assert_allclose(
+            self.arm.node_jacobians(self.angles)[-1],
+            self.arm.jacobian(self.angles),
+            atol=1e-12,
+        )
+
+    def test_base_node_has_zero_kinematics(self):
+        np.testing.assert_allclose(self.arm.node_jacobians(self.angles)[0], 0.0)
+        np.testing.assert_allclose(
+            self.arm.node_velocities(self.angles, self.velocities)[0], 0.0, atol=1e-15
+        )
+        np.testing.assert_allclose(
+            self.arm.node_accelerations(
+                self.angles, self.velocities, self.accelerations
+            )[0],
+            0.0,
+            atol=1e-15,
+        )
+
+    def test_node_velocity_matches_central_difference(self):
+        step = 1e-6
+        forward = self.arm.forward_kinematics(self.angles + step * self.velocities)
+        backward = self.arm.forward_kinematics(self.angles - step * self.velocities)
+        reference = (forward - backward) / (2.0 * step)
+        np.testing.assert_allclose(
+            self.arm.node_velocities(self.angles, self.velocities),
+            reference,
+            atol=1e-7,
+        )
+
+    def test_node_acceleration_matches_central_difference_of_velocity(self):
+        step = 1e-5
+        forward_angles = self.angles + step * self.velocities + 0.5 * step**2 * self.accelerations
+        backward_angles = self.angles - step * self.velocities + 0.5 * step**2 * self.accelerations
+        forward_velocities = self.velocities + step * self.accelerations
+        backward_velocities = self.velocities - step * self.accelerations
+        forward = self.arm.node_velocities(forward_angles, forward_velocities)
+        backward = self.arm.node_velocities(backward_angles, backward_velocities)
+        reference = (forward - backward) / (2.0 * step)
+        np.testing.assert_allclose(
+            self.arm.node_accelerations(self.angles, self.velocities, self.accelerations),
+            reference,
+            atol=1e-5,
+        )
+
+    def test_rejects_mismatched_velocity_shape(self):
+        with self.assertRaises(ValueError):
+            self.arm.node_velocities(self.angles, [0.1, 0.2])
+
+
 class TestPlanarArmForwardKinematics(unittest.TestCase):
     def test_two_links_straight_along_positive_x(self):
         arm = PlanarArm([1.0, 1.0])

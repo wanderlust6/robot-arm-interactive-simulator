@@ -1,0 +1,7 @@
+﻿scenario_id,scenario_type,method,sample_count,sequence_success,success_rate,unreachable_target_count,solver_failure_count,max_endpoint_error_m,p95_solve_time_ms
+workspace-inner_boundary,workspace_boundary,current_dls,9,True,1.0,0,0,6.534653827535809e-06,1.3156399993022203
+workspace-inner_boundary,workspace_boundary,sigma_adaptive_dls,9,False,0.0,0,9,1.7405902504891963e-05,6.499039999107481
+workspace-outer_boundary,workspace_boundary,current_dls,9,True,1.0,0,0,6.799200761657568e-06,1.5310800008592194
+workspace-outer_boundary,workspace_boundary,sigma_adaptive_dls,9,False,0.0,0,9,3.1036788724319816e-05,6.2839600002916995
+workspace-regular_reachable,workspace_boundary,current_dls,9,True,1.0,0,0,3.6253456154806364e-06,1.1871800008520947
+workspace-regular_reachable,workspace_boundary,sigma_adaptive_dls,9,True,1.0,0,0,3.0458958560226392e-06,1.0117800007719777

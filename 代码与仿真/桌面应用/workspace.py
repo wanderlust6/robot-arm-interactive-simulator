@@ -33,6 +33,7 @@ class ArmWorkspace(QWidget):
         self._fixed_nodes = {}
         self._shadow_joint_angles = None
         self._shadow_status = "disabled"
+        self._scheme_arms = []
         self._zoom = 1.0
         self._view_offset = QPointF(0.0, 0.0)
         self._panning = False
@@ -165,12 +166,61 @@ class ArmWorkspace(QWidget):
     def _shadow_joint_positions(self):
         if self._shadow_joint_angles is None:
             return None
-        absolute_angles = np.cumsum(self._shadow_joint_angles)
+        return self._joint_positions_for(self._shadow_joint_angles)
+
+    def _joint_positions_for(self, joint_angles):
+        """按给定关节角计算基座到末端的节点位置。"""
+        angles = np.asarray(joint_angles, dtype=float)
+        absolute_angles = np.cumsum(angles)
         vectors = np.column_stack((
             self._link_lengths * np.cos(absolute_angles),
             self._link_lengths * np.sin(absolute_angles),
         ))
         return np.vstack((np.zeros((1, 2)), np.cumsum(vectors, axis=0)))
+
+    def set_scheme_arms(self, arms):
+        """设置工作区叠加显示的方案机械臂。
+
+        每一项为 dict：key / label / color / angles / status / role。
+        role 为 "primary" 的条目只用于图例（主机械臂由 set_state 绘制）；
+        其余条目在角度有效时绘制为半透明叠加臂。失败与不适用的条目只出现在
+        图例中，不绘制机械臂，避免用插值伪造结果。
+        """
+        normalized = []
+        for arm in arms or []:
+            angles = arm.get("angles")
+            if angles is not None:
+                angles = np.asarray(angles, dtype=float)
+                if angles.shape != (len(self._link_lengths),) or not np.all(np.isfinite(angles)):
+                    angles = None
+            normalized.append({
+                "key": str(arm.get("key", "")),
+                "label": str(arm.get("label", "")),
+                "color": str(arm.get("color", "#6b7280")),
+                "angles": angles,
+                "status": str(arm.get("status", "pending")),
+                "role": str(arm.get("role", "overlay")),
+            })
+        self._scheme_arms = normalized
+        self.update()
+
+    def _scheme_legend_rows(self):
+        """返回图例文本行：(颜色, 标签, 状态说明)。"""
+        rows = []
+        for arm in self._scheme_arms:
+            status = arm["status"]
+            note = {
+                "primary": "主方案",
+                "ready": "",
+                "identical": "与主方案一致",
+                "preview": "跟随当前姿态",
+                "pending": "待播放",
+                "failed": "规划失败",
+                "conflict": "当前姿态无解",
+                "not_applicable": "不适用",
+            }.get(status, status)
+            rows.append((arm["color"], arm["label"], note))
+        return rows
 
     def _base_view_parameters(self):
         total_length = max(float(np.sum(self._link_lengths)), 0.5)
@@ -244,21 +294,21 @@ class ArmWorkspace(QWidget):
         self._draw_grid(painter, origin, scale)
         self._draw_drag_line(painter, origin, scale)
 
-        shadow_positions = self._shadow_joint_positions()
-        if shadow_positions is not None:
-            shadow_points = [self._world_to_screen(point, origin, scale) for point in shadow_positions]
-            for index in range(len(shadow_points) - 1):
-                shadow_pen = QPen(QColor("#e87524"), 8)
-                shadow_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-                painter.setPen(shadow_pen)
-                painter.drawLine(shadow_points[index], shadow_points[index + 1])
-            for point in shadow_points[:-1]:
-                painter.setPen(QPen(QColor("#fff7ed"), 2))
-                painter.setBrush(QColor("#c65d16"))
-                painter.drawEllipse(point, 5, 5)
-            painter.setPen(QPen(QColor("#c65d16"), 2))
-            painter.setBrush(QColor("#fff7ed"))
-            painter.drawEllipse(shadow_points[-1], 6, 6)
+        overlay_arms = [
+            arm for arm in self._scheme_arms
+            if arm["role"] != "primary" and arm["angles"] is not None
+        ]
+        if overlay_arms:
+            for arm in overlay_arms:
+                self._draw_scheme_arm(painter, arm, origin, scale)
+        elif self._shadow_joint_angles is not None:
+            # 兼容旧接口：只设置了单一影子臂时仍按原样绘制。
+            self._draw_scheme_arm(
+                painter,
+                {"color": "#e87524", "angles": self._shadow_joint_angles},
+                origin,
+                scale,
+            )
 
         positions = self._joint_positions()
         screen_points = [self._world_to_screen(point, origin, scale) for point in positions]
@@ -314,12 +364,14 @@ class ArmWorkspace(QWidget):
 
         painter.setPen(QColor("#27364b"))
         painter.drawText(18, 28, "二维机械臂工作区（坐标单位：m）")
-        if self._shadow_status == "failed":
-            painter.setPen(QColor("#b42318"))
-            painter.drawText(18, 72, "影子机械臂：规划失败（未绘制虚假轨迹）")
-        elif self._shadow_joint_angles is not None:
-            painter.setPen(QColor("#c65d16"))
-            painter.drawText(18, 72, "橙色：影子机械臂（独立算法关节轨迹）")
+        if not self._scheme_arms:
+            # 兼容旧接口的提示文字；使用叠加层后由右侧图例取代。
+            if self._shadow_status == "failed":
+                painter.setPen(QColor("#b42318"))
+                painter.drawText(18, 72, "影子机械臂：规划失败（未绘制虚假轨迹）")
+            elif self._shadow_joint_angles is not None:
+                painter.setPen(QColor("#c65d16"))
+                painter.drawText(18, 72, "橙色：影子机械臂（独立算法关节轨迹）")
         painter.setPen(QColor("#63738a"))
         instruction = (
             "轨迹编辑：单击添加直线锚点，按住拖动创建曲线锚点"
@@ -331,6 +383,44 @@ class ArmWorkspace(QWidget):
             )
         )
         painter.drawText(18, 50, instruction)
+
+        legend_rows = self._scheme_legend_rows()
+        if legend_rows:
+            legend_x = max(12, self.width() - 220)
+            legend_y = 96
+            for color_hex, label, note in legend_rows:
+                color = QColor(color_hex)
+                painter.setPen(QPen(color, 4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+                painter.drawLine(legend_x, legend_y - 4, legend_x + 20, legend_y - 4)
+                painter.setPen(QColor("#27364b"))
+                painter.drawText(
+                    legend_x + 26, legend_y,
+                    label if not note else f"{label}（{note}）",
+                )
+                legend_y += 17
+
+    def _draw_scheme_arm(self, painter, arm, origin, scale):
+        """绘制一条方案机械臂：半透明彩色连杆 + 白色描边关节点。"""
+        positions = self._joint_positions_for(arm["angles"])
+        points = [self._world_to_screen(point, origin, scale) for point in positions]
+        base_color = QColor(arm.get("color", "#6b7280"))
+        link_color = QColor(base_color)
+        link_color.setAlpha(165)
+        pen = QPen(link_color, 9)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        painter.setPen(pen)
+        for start, end in zip(points, points[1:]):
+            painter.drawLine(start, end)
+
+        joint_color = QColor(base_color)
+        joint_color.setAlpha(235)
+        painter.setPen(QPen(QColor("#ffffff"), 2))
+        painter.setBrush(joint_color)
+        for point in points[:-1]:
+            painter.drawEllipse(point, 5, 5)
+        painter.setPen(QPen(joint_color, 3))
+        painter.setBrush(QColor("#ffffff"))
+        painter.drawEllipse(points[-1], 6, 6)
 
     def _draw_trajectory_path(self, painter, origin, scale):
         anchors = list(self._path_anchors)

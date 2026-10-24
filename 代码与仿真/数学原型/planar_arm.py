@@ -69,6 +69,65 @@ class PlanarArm:
 
         return np.vstack((-joint_to_end[:, 1], joint_to_end[:, 0]))
 
+    def node_jacobians(self, joint_angles: Sequence[float]) -> np.ndarray:
+        """返回各节点的位置雅可比矩阵，形状为 (n + 1, 2, n)。
+
+        第 i 个节点（0 为基座）对第 m 个关节的偏导为
+        ``sum_{k=m}^{i-1} L_k * [-sin(theta_k), cos(theta_k)]``，
+        其中 ``theta_k`` 为第 k 根连杆的绝对角。
+        """
+        angles = self._validated_angles(joint_angles)
+        absolute_angles = np.cumsum(angles)
+        count = self.joint_count
+        jacobians = np.zeros((count + 1, 2, count), dtype=float)
+        for node in range(1, count + 1):
+            for joint_index in range(node):
+                span = slice(joint_index, node)
+                jacobians[node, 0, joint_index] = -np.sum(
+                    self._link_lengths[span] * np.sin(absolute_angles[span])
+                )
+                jacobians[node, 1, joint_index] = np.sum(
+                    self._link_lengths[span] * np.cos(absolute_angles[span])
+                )
+        return jacobians
+
+    def node_velocities(self, joint_angles: Sequence[float], joint_velocities: Sequence[float]) -> np.ndarray:
+        """返回各节点速度，形状为 (n + 1, 2)，单位 m/s。
+
+        用雅可比与关节角速度解析求得，避免对位置序列做数值微分——数值微分会把
+        采样上的微小不一致放大成可见抖动。
+        """
+        jacobians = self.node_jacobians(joint_angles)
+        velocities = self._validated_angles(joint_velocities)
+        return np.einsum("nij,j->ni", jacobians, velocities)
+
+    def node_accelerations(
+        self,
+        joint_angles: Sequence[float],
+        joint_velocities: Sequence[float],
+        joint_accelerations: Sequence[float],
+    ) -> np.ndarray:
+        """返回各节点加速度，形状为 (n + 1, 2)，单位 m/s²。
+
+        ``a_i = J_i q̈ + (dJ_i/dt) q̇``，其中
+        ``(dJ_i/dt) q̇ = sum_{k<i} L_k * [-cos(theta_k), -sin(theta_k)] * omega_k²``，
+        ``omega_k`` 为到第 k 个关节为止的累计角速度（θ̇_k 与 q̇ 的求和各贡献一次）。
+        """
+        angles = self._validated_angles(joint_angles)
+        velocities = self._validated_angles(joint_velocities)
+        accelerations = self._validated_angles(joint_accelerations)
+        absolute_angles = np.cumsum(angles)
+        absolute_velocities = np.cumsum(velocities)
+        jacobians = self.node_jacobians(angles)
+        result = np.einsum("nij,j->ni", jacobians, accelerations)
+        for node in range(1, self.joint_count + 1):
+            for k in range(node):
+                direction = np.array([-np.cos(absolute_angles[k]), -np.sin(absolute_angles[k])])
+                result[node] += (
+                    self._link_lengths[k] * absolute_velocities[k] ** 2 * direction
+                )
+        return result
+
     def singularity_metrics(self, joint_angles: Sequence[float]) -> dict[str, object]:
         """返回末端位置雅可比矩阵的秩、奇异值和条件数。
 

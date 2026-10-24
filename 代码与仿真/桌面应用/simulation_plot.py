@@ -1,12 +1,13 @@
-﻿"""Configurable simulation plots and axis-selection dialogs."""
+"""Configurable simulation plots and axis-selection dialogs."""
 
 import numpy as np
-from PySide6.QtCore import QPoint, Qt
+from PySide6.QtCore import QPoint, QPointF, Qt
 from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import (
     QComboBox, QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout,
     QLabel, QListWidget, QListWidgetItem, QPushButton, QVBoxLayout, QWidget,
 )
+from scipy.signal import savgol_filter
 
 
 VARIABLES = {
@@ -41,6 +42,105 @@ def variable_key(kind, index=0):
 def parse_variable(key):
     kind, _, index = key.partition(":")
     return kind, int(index or 0)
+
+
+def decimate_by_pixel(points, column_count, minimum_points_per_column=2.0):
+    """按像素列对折线做 min-max 抽取，保留每列的极值。
+
+    ``points`` 中允许 ``None`` 表示断点。返回 ``(抽取后的点列, 是否发生抽取)``。
+    同一像素列内的多个点只保留该列的**最小值与最大值**（按原始顺序），因此曲线
+    的极值包络完全不变，没有任何数值被修改；只是不再把上千个点硬塞进几百个像素。
+    点数不超过 ``minimum_points_per_column × column_count`` 时原样返回。
+    """
+    if column_count <= 0 or not points:
+        return list(points), False
+    usable = sum(1 for point in points if point is not None)
+    if usable <= minimum_points_per_column * column_count:
+        return list(points), False
+
+    reduced = []
+    bucket = []
+    current_column = None
+
+    def flush():
+        if not bucket:
+            return
+        if len(bucket) == 1:
+            reduced.append(bucket[0])
+            return
+        low = high = 0
+        for index, point in enumerate(bucket):
+            if point.y() < bucket[low].y():
+                low = index
+            if point.y() > bucket[high].y():
+                high = index
+        first, second = (low, high) if low <= high else (high, low)
+        reduced.append(bucket[first])
+        if second != first:
+            reduced.append(bucket[second])
+
+    for point in points:
+        if point is None:
+            flush()
+            bucket = []
+            current_column = None
+            reduced.append(None)
+            continue
+        column = int(point.x() // 1)
+        if current_column is None or column == current_column:
+            bucket.append(point)
+            current_column = column
+        else:
+            flush()
+            bucket = [point]
+            current_column = column
+    flush()
+
+    # 保证首尾点精确保留：它们是曲线的起止值，不应因为不在极值上而被丢弃。
+    original = [point for point in points if point is not None]
+    if original:
+        first_index = next(i for i, point in enumerate(reduced) if point is not None)
+        if reduced[first_index] is not original[0]:
+            reduced.insert(first_index, original[0])
+        last_index = next(i for i in range(len(reduced) - 1, -1, -1) if reduced[i] is not None)
+        if reduced[last_index] is not original[-1]:
+            reduced.insert(last_index + 1, original[-1])
+    return reduced, True
+
+
+def smooth_series(values, window=11, polyorder=3):
+    """用于**绘图显示**的零相位平滑（Savitzky-Golay）。
+
+    只应作用在绘制路径上：数据表、CSV 导出与可执行性检查必须使用原始值。
+    选择 Savitzky-Golay 而不是滑动平均：它用局部多项式拟合，能更好地保留峰形；
+    且是零相位滤波，不会让曲线在时间上左右平移。
+
+    - ``window`` 为窗口点数，会被强制成不小于 ``polyorder + 2`` 的奇数。
+    - 含 NaN 的序列先按有限样本线性插值再滤波，滤波后恢复原 NaN 位置，保持断点。
+    - 点数不足或参数无效时原样返回，不做任何改动。
+    """
+    values = np.asarray(values, dtype=float)
+    if values.ndim != 1 or values.size < 5:
+        return values
+    usable = np.isfinite(values)
+    if np.count_nonzero(usable) < 5:
+        return values
+    points = int(window)
+    if points % 2 == 0:
+        points += 1
+    points = min(points, values.size if values.size % 2 == 1 else values.size - 1)
+    if points <= polyorder + 1:
+        return values
+    order = min(int(polyorder), points - 2)
+
+    if np.all(usable):
+        return savgol_filter(values, points, order, mode="interp")
+    filled = values.copy()
+    filled[~usable] = np.interp(
+        np.flatnonzero(~usable), np.flatnonzero(usable), values[usable]
+    )
+    filtered = savgol_filter(filled, points, order, mode="interp")
+    return np.where(usable, filtered, np.nan)
 
 
 class AxisSelectionDialog(QDialog):
@@ -131,6 +231,13 @@ class SimulationPlot(QWidget):
         self.setMouseTracking(True)
         self._drawn_points = []
         self._selected_point = None
+        # 本次绘制是否发生了按像素列的极值抽取（只影响绘制，不影响数值）。
+        self._display_decimated = False
+        # 显示平滑：默认关闭，只影响绘制路径，不改变任何被记录或被导出的数值。
+        self._smoothing_enabled = False
+        self._smoothing_window = 11
+        self._smoothing_polyorder = 3
+        self._display_smoothed = False
         self._min_singular_values = np.empty(0, dtype=float)
         self._condition_numbers = np.empty(0, dtype=float)
         self._endpoint_errors = np.empty(0, dtype=float)
@@ -140,7 +247,7 @@ class SimulationPlot(QWidget):
         self.x_scheme_key = "continuous"
         self.y_scheme_keys = []
 
-    def set_data(self, times, positions, angles, current_time, duration, torques=None, joint_velocities=None, joint_accelerations=None, min_singular_values=None, condition_numbers=None, endpoint_errors=None, scheme_series=None, scheme_states=None):
+    def set_data(self, times, positions, angles, current_time, duration, torques=None, joint_velocities=None, joint_accelerations=None, min_singular_values=None, condition_numbers=None, endpoint_errors=None, scheme_series=None, scheme_states=None, node_velocities=None, node_accelerations=None):
         self._times = np.asarray(times, dtype=float).copy()
         pos = np.asarray(positions, dtype=float)
         if pos.size == 0:
@@ -162,6 +269,17 @@ class SimulationPlot(QWidget):
         self._endpoint_errors = np.asarray(endpoint_errors, dtype=float).copy() if endpoint_errors is not None else np.empty(0, dtype=float)
         self._scheme_series = list(scheme_series or [])
         self._scheme_states = dict(scheme_states or {})
+        # 节点速度/加速度的解析值，形状 (采样数, 节点数, 2)；缺失时退回数值微分。
+        node_velocity_values = (
+            np.asarray(node_velocities, dtype=float)
+            if node_velocities is not None else np.empty((0, 0, 2), dtype=float)
+        )
+        node_acceleration_values = (
+            np.asarray(node_accelerations, dtype=float)
+            if node_accelerations is not None else np.empty((0, 0, 2), dtype=float)
+        )
+        self._node_velocities = node_velocity_values
+        self._node_accelerations = node_acceleration_values
         self._current_time = max(0.0, float(current_time))
         self._duration = max(float(duration), 1e-9)
         self.update()
@@ -177,7 +295,19 @@ class SimulationPlot(QWidget):
         self.scheme_key = self.x_scheme_key
         self.update()
 
-    def _values(self, key, scheme_key=None):
+    def _values(self, key, scheme_key=None, smooth=False):
+        """曲线取值。
+
+        ``smooth=True`` 仅供**绘制**使用：启用显示平滑时对序列做零相位
+        Savitzky-Golay 滤波。默认 ``False``，因此数据表格、CSV 导出、
+        可执行性检查与「诊断当前列」拿到的始终是原始数值。
+        """
+        values = self._raw_values(key, scheme_key)
+        if smooth and self._smoothing_enabled:
+            return smooth_series(values, self._smoothing_window, self._smoothing_polyorder)
+        return values
+
+    def _raw_values(self, key, scheme_key=None):
         kind, index = parse_variable(key)
         count = len(self._times)
         if kind == "time":
@@ -193,8 +323,7 @@ class SimulationPlot(QWidget):
                 return np.r_[0.0,np.cumsum(np.linalg.norm(np.diff(pts,axis=0),axis=1))]
             if kind.startswith("node_"):
                 node=min(max(index,0),sp.shape[1]-1); coords=sp[:,node,:]
-                vel=np.gradient(coords,self._times,axis=0,edge_order=1) if count>1 else np.zeros_like(coords)
-                acc=np.gradient(vel,self._times,axis=0,edge_order=1) if count>2 else np.zeros_like(coords)
+                vel, acc = self._node_kinematics(node, coords, count)
                 if kind=="node_x": return coords[:,0]
                 if kind=="node_y": return coords[:,1]
                 if kind=="node_vx": return vel[:,0]
@@ -208,9 +337,13 @@ class SimulationPlot(QWidget):
             if kind in ("joint_velocity", "joint_accel"):
                 if index >= sa.shape[1]:
                     return np.zeros(count)
-                # Derive velocity/acceleration from this scheme's own recorded joint angles.
-                # Do not fall back to the currently active trajectory, which would make
-                # two different planning schemes appear to have identical curves.
+                # 优先使用该方案样条的解析导数。只有缺失时才退回数值微分：
+                # 对记录角度做两次差分会被墙钟采样的时间抖动放大成加速度噪声。
+                stored = state.get("velocities" if kind == "joint_velocity" else "accelerations")
+                if stored is not None:
+                    stored = np.asarray(stored, dtype=float)
+                    if stored.shape == sa.shape and np.any(np.isfinite(stored[:, index])):
+                        return stored[:, index]
                 unwrapped = np.unwrap(sa, axis=0)
                 scheme_velocity = np.gradient(unwrapped, self._times, axis=0, edge_order=1) if count > 1 else np.zeros_like(unwrapped)
                 if kind == "joint_velocity":
@@ -224,10 +357,7 @@ class SimulationPlot(QWidget):
         if kind.startswith("node_"):
             node = min(max(index, 0), self._positions.shape[1] - 1)
             coords = self._positions[:, node, :]
-            dt = np.diff(self._times)
-            safe_dt = np.where(dt > 1e-12, dt, np.nan)
-            velocity = np.gradient(coords, self._times, axis=0, edge_order=1) if count > 1 else np.zeros_like(coords)
-            acceleration = np.gradient(velocity, self._times, axis=0, edge_order=1) if count > 2 else np.zeros_like(coords)
+            velocity, acceleration = self._node_kinematics(node, coords, count)
             if kind == "node_x": return coords[:, 0]
             if kind == "node_y": return coords[:, 1]
             if kind == "node_vx": return velocity[:, 0]
@@ -274,6 +404,36 @@ class SimulationPlot(QWidget):
                 return np.gradient(velocity, self._times, axis=0, edge_order=1) if count > 2 else np.zeros(count)
         return np.zeros(count)
 
+    def _node_kinematics(self, node, coords, count):
+        """返回某节点的速度与加速度。
+
+        优先使用规划样条导数经雅可比求得的**解析值**（由 set_data 传入）。
+        只有缺失时才退回对位置序列做数值微分——那会把采样上的微小不一致
+        放大成可见抖动，而且对"速度大小/加速度大小"这类模长量尤其明显。
+        """
+        velocities = np.asarray(self._node_velocities, dtype=float)
+        accelerations = np.asarray(self._node_accelerations, dtype=float)
+        if (
+            velocities.ndim == 3
+            and velocities.shape[0] == count
+            and node < velocities.shape[1]
+            and accelerations.shape == velocities.shape
+        ):
+            return velocities[:, node, :], accelerations[:, node, :]
+        velocity = np.gradient(coords, self._times, axis=0, edge_order=1) if count > 1 else np.zeros_like(coords)
+        acceleration = np.gradient(velocity, self._times, axis=0, edge_order=1) if count > 2 else np.zeros_like(coords)
+        return velocity, acceleration
+
+    def set_smoothing(self, enabled, window=11, polyorder=3):
+        """设置"仅用于绘图"的显示平滑。数值与导出数据不受影响。"""
+        self._smoothing_enabled = bool(enabled)
+        self._smoothing_window = int(window)
+        self._smoothing_polyorder = int(polyorder)
+        self.update()
+
+    def smoothing_enabled(self):
+        return bool(self._smoothing_enabled)
+
     def _x_values(self, scheme_key=None):
         return self._values(self.x_variable, scheme_key or self.x_scheme_key)
 
@@ -305,8 +465,10 @@ class SimulationPlot(QWidget):
             return
         x = self._x_values(self.x_scheme_key)
         self._drawn_points = []
+        self._display_decimated = False
+        self._display_smoothed = bool(self._smoothing_enabled)
         series = [
-            (key, self._values(key, scheme), scheme)
+            (key, self._values(key, scheme, smooth=True), scheme)
             for key, scheme in zip(self.y_variables, self.y_scheme_keys)
         ]
         valid = [(key, values, scheme) for key, values, scheme in series if len(values) == len(x)]
@@ -358,17 +520,26 @@ class SimulationPlot(QWidget):
                         continue
                     px = left + (xv - xmin) / (xmax - xmin) * (self.width() - left - right)
                     py = area_bottom - (yv - ymin) / (ymax - ymin) * panel_h
-                    pixel_point = (int(px), int(py))
+                    # 用浮点坐标绘制：每个采样点只占 1–2 像素时，整数取整会在相邻点
+                    # 之间产生 ±1 px 抖动，在陡峭段表现为锯齿，看起来像"数据在抖"。
+                    pixel_point = QPointF(px, py)
                     points.append(pixel_point)
-                    self._drawn_points.append((pixel_point[0], pixel_point[1], float(xv), float(yv), key))
+                    self._drawn_points.append((px, py, float(xv), float(yv), key))
                 painter.setPen(QPen(color, 1.8))
+                # 采样点多于像素列时按列做 min-max 抽取：每列保留该列内的最小与
+                # 最大值，包络和峰值完整保留，所有数值一个都不改，只是不再把上千个
+                # 点硬挤进几百像素（那会造成视觉上的锯齿）。
+                area_width = int(max(1, round(self.width() - left - right)))
+                drawn_points, decimated = decimate_by_pixel(points, area_width)
+                if decimated:
+                    self._display_decimated = True
                 previous = None
-                for point in points:
+                for point in drawn_points:
                     if point is None:
                         previous = None
                     else:
                         if previous is not None:
-                            painter.drawLine(previous[0], previous[1], point[0], point[1])
+                            painter.drawLine(previous, point)
                         previous = point
                 kind, series_index = parse_variable(key)
                 label = VARIABLES.get(kind, (key, "", ""))[0]
@@ -398,6 +569,19 @@ class SimulationPlot(QWidget):
             painter.setPen(QColor("#475569"))
             x_label = VARIABLES.get(parse_variable(self.x_variable)[0], (self.x_variable, "", ""))[0]
             painter.drawText(left, min(self.height() - 4, area_bottom + 29), x_label)
+        if self._display_smoothed and self.width() > 520:
+            painter.setPen(QColor("#b45309"))
+            painter.drawText(
+                self.width() - 330, 20,
+                f"显示已平滑（Savitzky-Golay，{self._smoothing_window} 点；数值未改）",
+            )
+        if self._display_decimated and self.width() > 520:
+            # 明确标注：只是绘制时按像素列抽取极值，数值、峰值与导出数据均未改变。
+            painter.setPen(QColor("#94a3b8"))
+            painter.drawText(
+                self.width() - 260, 20,
+                "显示：按像素列抽取极值（数值未改）",
+            )
         if self._selected_point is not None:
             sx, sy, selected_x, selected_y, selected_key = self._selected_point
             painter.setPen(QPen(QColor("#dc2626"), 2))

@@ -1,0 +1,11 @@
+{
+  "sample_count": 0,
+  "duration_s": 0.0,
+  "joint_count": 3,
+  "max_abs_joint_angle_rad": [],
+  "max_abs_joint_velocity_rad_s": [],
+  "max_abs_joint_acceleration_rad_s2": [],
+  "max_abs_joint_torque_Nm": [],
+  "end_effector_path_length_m": 0.0,
+  "data_note": "速度和加速度按规划轨迹导数记录；力矩为当前理想刚体模型估计值。"
+}

@@ -1,0 +1,50 @@
+{
+  "experiment_id": "desktop-auto-demo",
+  "scenario_id": "workspace-regular_reachable",
+  "solver_config": {
+    "max_iterations": 120,
+    "tolerance_m": 1e-05,
+    "base_damping": 0.05,
+    "sigma_threshold": 0.02,
+    "gain": 0.05,
+    "max_damping": 1.0
+  },
+  "summaries": {
+    "current_dls": {
+      "method": "current_dls",
+      "sample_count": 9,
+      "successful_points": 9,
+      "unreachable_target_count": 0,
+      "solver_failure_count": 0,
+      "sequence_success": true,
+      "success_rate": 1.0,
+      "first_failure_index": null,
+      "first_failure_code": null,
+      "max_endpoint_error_m": 3.6253456154806364e-06,
+      "p95_endpoint_error_m": 3.17750585084668e-06,
+      "max_joint_step_rad": 2.950250330240839,
+      "min_singular_value": 0.3632320413242474,
+      "total_solve_time_ms": 4.797900000994559,
+      "p95_solve_time_ms": 1.17926000020816,
+      "tolerance_m": 1e-05
+    },
+    "sigma_adaptive_dls": {
+      "method": "sigma_adaptive_dls",
+      "sample_count": 9,
+      "successful_points": 9,
+      "unreachable_target_count": 0,
+      "solver_failure_count": 0,
+      "sequence_success": true,
+      "success_rate": 1.0,
+      "first_failure_index": null,
+      "first_failure_code": null,
+      "max_endpoint_error_m": 3.0458958560226392e-06,
+      "p95_endpoint_error_m": 2.8736575119123733e-06,
+      "max_joint_step_rad": 2.950256605958524,
+      "min_singular_value": 0.3632321038009065,
+      "total_solve_time_ms": 4.971100002876483,
+      "p95_solve_time_ms": 1.0727800014137754,
+      "tolerance_m": 1e-05
+    }
+  }
+}

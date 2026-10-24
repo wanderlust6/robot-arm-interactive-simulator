@@ -1,0 +1,3 @@
+﻿method,sample_count,successful_points,unreachable_target_count,solver_failure_count,sequence_success,success_rate,first_failure_index,first_failure_code,max_endpoint_error_m,p95_endpoint_error_m,max_joint_step_rad,min_singular_value,total_solve_time_ms,p95_solve_time_ms,tolerance_m
+current_dls,9,9,0,0,True,1.0,,,3.6253456154806364e-06,3.17750585084668e-06,2.950250330240839,0.3632320413242474,4.7291000046243425,1.023479999275878,1e-05
+sigma_adaptive_dls,9,9,0,0,True,1.0,,,3.0458958560226392e-06,2.8736575119123733e-06,2.950256605958524,0.3632321038009065,5.514000004041009,1.221240000450052,1e-05
